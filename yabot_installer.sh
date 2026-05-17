@@ -78,12 +78,13 @@ main_menu() {
     echo -e "  ${GREEN}6)${NC} Настроить автовключение ВМ"
     echo -e "  ${GREEN}7)${NC} Обновить конфигурацию"
     echo -e "  ${GREEN}8)${NC} 🔄 Обновить скрипты ботов"
+    echo -e "  ${GREEN}9)${NC} ⬆️  Обновить установщик с GitHub"
     echo -e "  ${RED}0)${NC} Выход"; echo ""
     read -p "Введите номер действия: " choice
     case $choice in
         1) install_bot ;; 2) uninstall_bot ;; 3) check_status ;;
         4) view_logs ;;   5) restart_bot ;;  6) setup_auto_power ;;
-        7) update_config ;; 8) update_bot_scripts ;; 0) exit 0 ;;
+        7) update_config ;; 8) update_bot_scripts ;; 9) update_from_github ;; 0) exit 0 ;;
         *) echo -e "${RED}Неверный выбор!${NC}"; sleep 2; main_menu ;;
     esac
 }
@@ -2388,6 +2389,56 @@ $M $H * * * PATH=/usr/local/bin:/usr/bin:/bin $PY $SC --stop # VM_BOT"; }
 }
 
 # ─────────────────────────────────────────────────────────────
+# ОБНОВЛЕНИЕ УСТАНОВЩИКА С GITHUB
+# ─────────────────────────────────────────────────────────────
+
+GITHUB_RAW="https://raw.githubusercontent.com/z3552/z3552_yabot/main/yabot_installer.sh"
+
+update_from_github() {
+    print_header
+    echo -e "${CYAN}⬆️  ОБНОВЛЕНИЕ С GITHUB${NC}"; echo ""
+    echo -e "${YELLOW}Источник:${NC} $GITHUB_RAW"; echo ""
+
+    # Текущая версия
+    CUR_VER=$(grep -oP 'yabot_installer v\K[0-9.]+' "$0" 2>/dev/null || echo "?")
+    echo -e "${YELLOW}Текущая версия:${NC} v$CUR_VER"
+
+    # Скачиваем во временный файл
+    TMP=$(mktemp)
+    echo -e "${YELLOW}Скачиваем...${NC}"
+    if ! curl -fsSL "$GITHUB_RAW" -o "$TMP" 2>/dev/null; then
+        echo -e "${RED}❌ Ошибка загрузки. Проверьте интернет.${NC}"
+        rm -f "$TMP"; echo ""; read -p "Enter..."; main_menu; return
+    fi
+
+    NEW_VER=$(grep -oP 'yabot_installer v\K[0-9.]+' "$TMP" 2>/dev/null || echo "?")
+    echo -e "${YELLOW}Версия на GitHub:${NC}  v$NEW_VER"; echo ""
+
+    if [ "$CUR_VER" = "$NEW_VER" ]; then
+        echo -e "${GREEN}✅ Уже последняя версия (v$CUR_VER)${NC}"
+        rm -f "$TMP"; echo ""; read -p "Enter..."; main_menu; return
+    fi
+
+    echo -e "${CYAN}Доступно обновление: v$CUR_VER → v$NEW_VER${NC}"; echo ""
+    read -p "Установить и обновить скрипты ботов? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then
+        rm -f "$TMP"; echo -e "${GREEN}Отменено${NC}"; sleep 1; main_menu; return
+    fi
+
+    # Заменяем установщик
+    cp "$TMP" /root/yabot_installer.sh
+    chmod +x /root/yabot_installer.sh
+    ln -sf /root/yabot_installer.sh /usr/local/bin/yabot
+    rm -f "$TMP"
+    echo -e "${GREEN}✅ Установщик обновлён до v$NEW_VER${NC}"; echo ""
+
+    # Применяем новые скрипты ботов
+    echo -e "${YELLOW}Применяем обновления ботов...${NC}"; echo ""
+    # Перезапускаем себя с опцией 8 через exec
+    exec bash /root/yabot_installer.sh --update-scripts
+}
+
+# ─────────────────────────────────────────────────────────────
 # ОБНОВЛЕНИЕ СКРИПТОВ БОТОВ (без переустановки)
 # ─────────────────────────────────────────────────────────────
 
@@ -2474,4 +2525,5 @@ update_bot_scripts() {
 
 # ─────────────────────────────────────────────────────────────
 check_root || true
+[ "$1" = "--update-scripts" ] && update_bot_scripts && exit 0
 main_menu
