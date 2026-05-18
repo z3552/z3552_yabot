@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v6.0
+# Автор: z3552[Reenpak]  |  yabot_installer v5.9
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -1519,7 +1519,7 @@ create_vk_bot_script() {
 # -*- coding: utf-8 -*-
 """VK бот управления ВМ Яндекс.Облака. v4.2"""
 
-import json,os,random,subprocess,logging,time,sys,threading,io,re,tempfile,glob
+import json,os,random,subprocess,logging,time,sys,threading,io,re,tempfile
 from pathlib import Path
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll,VkBotEventType
@@ -1782,125 +1782,37 @@ def handle(vk,uid,text):
     if re.search(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+',text):
         if not cfg.get("user_token"):
             send(vk,uid,"❌ Для YouTube нужен VK User Token. Добавь его через «Обновить конфигурацию» (пункт 7 в меню)."); return
-        import tempfile,glob
+        send(vk,uid,"⏳ Скачиваю видео...")
         ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
-        ffmpeg_bin="ffmpeg"
-
-        # Получаем метаданные для определения дубляжей
-        send(vk,uid,"🔍 Получаю информацию о видео...")
-        try:
-            import yt_dlp as yt_dlp_lib
-            ydl_opts={"quiet":True,"no_warnings":True,"noplaylist":True}
-            with yt_dlp_lib.YoutubeDL(ydl_opts) as ydl:
-                info=ydl.extract_info(text,download=False)
-            title=info.get("title","YouTube")[:60]
-            formats=info.get("formats",[])
-
-            # Ищем дублированные аудиодорожки
-            dubbed=[]
-            for f in formats:
-                note=(f.get("format_note") or "").lower()
-                lang=f.get("language") or ""
-                if f.get("acodec")!="none" and f.get("vcodec")=="none":
-                    if "dubbed" in note or "дубляж" in note or (lang and lang!="en" and lang!="und"):
-                        dubbed.append({"lang":lang,"label":f"{lang.upper()} dubbed" if lang else note,"fid":f["format_id"]})
-
-            # Если есть дубляжи — спрашиваем
-            if dubbed:
-                dub_list="\n".join([f"{i+1}. {d['label']}" for i,d in enumerate(dubbed)])
-                msg=f"🎬 {title}\n\nДоступны дубляжи:\n{dub_list}\n{len(dubbed)+1}. Оригинал\n\nОтветь номером:"
-                send(vk,uid,msg)
-                states[uid]="yt_dub_choice"
-                pending[uid]={"url":text,"dubbed":dubbed,"title":title}
-                return
-
-        except Exception as e:
-            logger.warning(f"yt metadata: {e}")
-            title="YouTube"
-
-        # Без дубляжей — скачиваем сразу
-        send(vk,uid,f"⏳ Скачиваю «{title}»...")
+        import tempfile,glob
         with tempfile.TemporaryDirectory() as tmp:
             out=f"{tmp}/video.%(ext)s"
             try:
                 r=subprocess.run([ytdlp,
-                    "-f","bestvideo+bestaudio/best",
+                    "-f","bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
                     "--merge-output-format","mp4",
-                    "--postprocessor-args",f"ffmpeg:-c:v copy -c:a aac",
-                    "--ffmpeg-location",ffmpeg_bin,
                     "--no-playlist","--socket-timeout","30",
                     "-o",out,"--no-part",text],
                     capture_output=True,text=True,timeout=300,
                     env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
                 if r.returncode!=0:
                     send(vk,uid,f"❌ Ошибка:\n{(r.stderr or r.stdout)[-400:]}"); return
-                files=glob.glob(f"{tmp}/video.*") or glob.glob(f"{tmp}/*.mp4")
+                files=glob.glob(f"{tmp}/video.*")
                 if not files: send(vk,uid,"❌ Файл не найден"); return
                 vpath=files[0]; sz=os.path.getsize(vpath)/(1024*1024)
                 send(vk,uid,f"⬆️ Загружаю в VK ({sz:.1f} MB)...")
+                # Загружаем через пользовательский токен
                 user_session=vk_api.VkApi(token=cfg["user_token"])
                 upload=vk_api.VkUpload(user_session)
-                video=upload.video(vpath,name=f"{title} ({sz:.1f} MB)",
+                video=upload.video(vpath,name=f"YouTube ({sz:.1f} MB)",
                                    group_id=cfg["group_id"],is_private=1)
                 owner_id=video.get("owner_id",-cfg["group_id"]); video_id=video["video_id"]
                 att=f"video{owner_id}_{video_id}"
                 cur_kbd={"main":kbd_main,"tools":kbd_tools}.get(st,kbd_main)()
-                send_attach(vk,uid,f"📹 {title} ({sz:.1f} MB)",att,cur_kbd)
+                send_attach(vk,uid,f"📹 YouTube ({sz:.1f} MB)",att,cur_kbd)
                 db.log_command("vk",uid,f"yt {text[:80]}",f"{sz:.1f}MB",True)
             except subprocess.TimeoutExpired:
                 send(vk,uid,"⏱ Таймаут. Попробуй более короткое видео.")
-            except Exception as e:
-                send(vk,uid,f"❌ {e}")
-        return
-
-    elif st=="yt_dub_choice":
-        data=pending.get(uid,{})
-        url=data.get("url",""); dubbed=data.get("dubbed",[]); title=data.get("title","YouTube")
-        try: choice=int(text.strip())-1
-        except: send(vk,uid,"❌ Введи номер из списка"); return
-        import tempfile,glob
-        ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
-        ffmpeg_bin="ffmpeg"
-
-        if choice==len(dubbed):  # Оригинал
-            fmt="bestvideo+bestaudio/best"; dub_label="оригинал"
-        elif 0<=choice<len(dubbed):
-            dub=dubbed[choice]; dub_label=dub["label"]
-            fmt=f"bestvideo+{dub['fid']}/bestvideo+bestaudio/best"
-        else:
-            send(vk,uid,"❌ Неверный номер"); return
-
-        states[uid]=pending.pop(uid,{}).get("prev_state","main")
-        send(vk,uid,f"⏳ Скачиваю «{title}» ({dub_label})...")
-        with tempfile.TemporaryDirectory() as tmp:
-            out=f"{tmp}/video.%(ext)s"
-            try:
-                r=subprocess.run([ytdlp,
-                    "-f",fmt,
-                    "--merge-output-format","mp4",
-                    "--postprocessor-args",f"ffmpeg:-c:v copy -c:a aac",
-                    "--ffmpeg-location",ffmpeg_bin,
-                    "--no-playlist","--socket-timeout","30",
-                    "-o",out,"--no-part",url],
-                    capture_output=True,text=True,timeout=300,
-                    env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
-                if r.returncode!=0:
-                    send(vk,uid,f"❌ Ошибка:\n{(r.stderr or r.stdout)[-400:]}"); return
-                files=glob.glob(f"{tmp}/video.*") or glob.glob(f"{tmp}/*.mp4")
-                if not files: send(vk,uid,"❌ Файл не найден"); return
-                vpath=files[0]; sz=os.path.getsize(vpath)/(1024*1024)
-                send(vk,uid,f"⬆️ Загружаю в VK ({sz:.1f} MB)...")
-                user_session=vk_api.VkApi(token=cfg["user_token"])
-                upload=vk_api.VkUpload(user_session)
-                video=upload.video(vpath,name=f"{title} [{dub_label}] ({sz:.1f} MB)",
-                                   group_id=cfg["group_id"],is_private=1)
-                owner_id=video.get("owner_id",-cfg["group_id"]); video_id=video["video_id"]
-                att=f"video{owner_id}_{video_id}"
-                cur_kbd=kbd_main()
-                send_attach(vk,uid,f"📹 {title} [{dub_label}] ({sz:.1f} MB)",att,cur_kbd)
-                db.log_command("vk",uid,f"yt {url[:80]}",f"{dub_label} {sz:.1f}MB",True)
-            except subprocess.TimeoutExpired:
-                send(vk,uid,"⏱ Таймаут.")
             except Exception as e:
                 send(vk,uid,f"❌ {e}")
         return
@@ -2690,8 +2602,8 @@ update_bot_scripts() {
             || echo -e "  ${RED}❌ Ошибка установки TG зависимостей${NC}"
     fi
     if is_installed vk && [ -f "$VK_DIR/venv/bin/pip" ]; then
-        "$VK_DIR/venv/bin/pip" install --quiet Pillow qrcode yt-dlp \
-            && echo -e "  ${GREEN}✅ VK venv: Pillow qrcode yt-dlp${NC}" \
+        "$VK_DIR/venv/bin/pip" install --quiet Pillow qrcode \
+            && echo -e "  ${GREEN}✅ VK venv: Pillow qrcode${NC}" \
             || echo -e "  ${RED}❌ Ошибка установки VK зависимостей${NC}"
     fi
     echo ""
