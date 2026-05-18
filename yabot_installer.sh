@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v5.3
+# Автор: z3552[Reenpak]  |  yabot_installer v5.7
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -281,6 +281,10 @@ get_user_inputs_vk() {
     echo ""; read -p "VK User ID(s) через запятую: " VK_USER_IDS
     [ -z "$VK_USER_IDS" ] && echo -e "${RED}❌ Нужен хотя бы один ID${NC}" && exit 1
     VK_USER_IDS=$(echo "$VK_USER_IDS" | tr -d ' ')
+    echo ""
+    echo -e "${YELLOW}Пользовательский токен VK (для загрузки видео YouTube).${NC}"
+    echo -e "${YELLOW}Получить: vk.com/dev → Standalone-приложение → access_token с правами video${NC}"
+    read -p "VK User Token (Enter — пропустить): " VK_USER_TOKEN
     echo -e "${GREEN}✅ Данные VK собраны${NC}"; echo ""
 }
 
@@ -325,7 +329,7 @@ create_shared_config() {
 
     if $INSTALL_VK; then
         VK_USERS_JSON=$(echo "$VK_USER_IDS"|tr ','  '\n'|sed 's/^[[:space:]]*//'|jq -R 'tonumber'|jq -s '.')
-        VK_BLOCK="\"vk\":{\"group_token\":\"$VK_TOKEN\",\"group_id\":$VK_GROUP_ID,\"allowed_users\":$VK_USERS_JSON}"
+        VK_BLOCK="\"vk\":{\"group_token\":\"$VK_TOKEN\",\"group_id\":$VK_GROUP_ID,\"allowed_users\":$VK_USERS_JSON,\"user_token\":\"$VK_USER_TOKEN\"}"
     else
         VK_BLOCK='"vk":null'
     fi
@@ -603,8 +607,7 @@ def set_sensitive(val):
  CONSOLE_INPUT,
  WG_ADDUSER_NAME, WG_GETUSER_NAME, WG_DELUSER_NAME, WG_DELUSER_PIN,
  VKPANEL_STOP_PIN,
- XUI_STOP_PIN, XUI_PORT_PIN, XUI_PORT_INPUT, XUI_RESET_PIN,
- YT_URL_STATE) = range(15)
+ XUI_STOP_PIN, XUI_PORT_PIN, XUI_PORT_INPUT, XUI_RESET_PIN) = range(14)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO,
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()])
@@ -774,14 +777,11 @@ def kbd_main():
     return ReplyKeyboardMarkup(rows,resize_keyboard=True)
 
 def kbd_tools():
-    rows = [
+    return ReplyKeyboardMarkup([
         [KeyboardButton("💻 Терминал"),     KeyboardButton("🔑 Туннель")],
         [KeyboardButton("📡 Медиасервер"),  KeyboardButton("⚙️ Ядро")],
-    ]
-    if not get_sensitive():
-        rows.append([KeyboardButton("📹 YouTube")])
-    rows.append([KeyboardButton("« Назад")])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        [KeyboardButton("« Назад")],
+    ],resize_keyboard=True)
 
 def kbd_schedule():
     s="🟢" if schedule_config.auto_start_enabled else "🔴"
@@ -1358,25 +1358,16 @@ async def xui_reset_pin(u,c):
     db.log_command("tg",u.effective_user.id,"xui reset",out[:100],ok)
     return ConversationHandler.END
 
-# ── YouTube download ─────────────────────────────────────────
-@check_access
-async def yt_begin(u,c):
-    await u.message.reply_text(
-        "📹 Отправь ссылку на YouTube-видео — бот пришлёт её через встроенный плеер Telegram.\n\nИли /cancel для отмены",
-        reply_markup=ReplyKeyboardRemove())
-    return YT_URL_STATE
+# ── YouTube inline (автодетект ссылок) ───────────────────────
+YT_RE=re.compile(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+')
 
 @check_access
-async def yt_download(u,c):
+async def yt_inline(u,c):
     text=u.message.text.strip()
     uid=u.effective_user.id
-    if not text.startswith("http"):
-        await u.message.reply_text("❌ Введи корректную ссылку (http...):")
-        return YT_URL_STATE
     # Telegram автоматически встраивает YouTube через внутренний плеер
-    await u.message.reply_text(text, reply_markup=kbd_main())
+    await u.message.reply_text(text,reply_markup=kbd_main())
     db.log_command("tg",uid,f"yt {text[:80]}","embedded",True)
-    return ConversationHandler.END
 
 # ── Cron ─────────────────────────────────────────────────────
 def update_cron():
@@ -1463,12 +1454,10 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^🔃 Ядро-сброс$"),xui_reset_begin)],
         states={XUI_RESET_PIN:[MessageHandler(filters.TEXT&~filters.COMMAND,xui_reset_pin)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-    app.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📹 YouTube$"),yt_begin)],
-        states={YT_URL_STATE:[MessageHandler(filters.TEXT&~filters.COMMAND,yt_download)]},
-        fallbacks=[CommandHandler("cancel",cancel_h)]))
 
     H=app.add_handler
+    # ── YouTube: автодетект ссылок ──
+    H(MessageHandler(filters.Regex(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+'),yt_inline))
     # ── Обычные обработчики ──
     H(MessageHandler(filters.Regex("^📊 Статус$"),status_handler))
     H(MessageHandler(filters.Regex("^ℹ️ Информация$"),info_handler))
@@ -1570,6 +1559,7 @@ def load_cfg():
             "admin_pin":d.get("admin_pin",""),
             "group_token":v.get("group_token",""),"group_id":int(v.get("group_id",0)),
             "allowed_users":[int(u) for u in v.get("allowed_users",[])],
+            "user_token":v.get("user_token",""),
             "tg_installed":"tg" in (d.get("installed") or [])}
 
 cfg=load_cfg()
@@ -1726,13 +1716,10 @@ def kbd_main():
     return _kbd(rows)
 
 def kbd_tools():
-    rows=[
+    return _kbd([
         [{"l":"💻 Терминал"},{"l":"🔑 Туннель","c":"primary"}],
         [{"l":"📡 Медиасервер"},{"l":"⚙️ Ядро","c":"primary"}],
-    ]
-    if not get_sensitive(): rows.append([{"l":"📹 YouTube","c":"primary"}])
-    rows.append([{"l":"« Назад"}])
-    return _kbd(rows)
+        [{"l":"« Назад"}]])
 
 def kbd_tg():
     a=svc_active(TG_SVC)
@@ -1790,6 +1777,50 @@ def send_attach(vk,uid,text,attachment,kbd=None):
 def handle(vk,uid,text):
     if uid not in cfg["allowed_users"]: send(vk,uid,"⛔ Нет доступа"); return
     st=states.get(uid,"main"); text=text.strip()
+
+    # ── YouTube: автодетект ссылок в любом состоянии ────────────
+    if re.search(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+',text):
+        if not cfg.get("user_token"):
+            send(vk,uid,"❌ Для YouTube нужен VK User Token. Добавь его через «Обновить конфигурацию» (пункт 7 в меню)."); return
+        send(vk,uid,"⏳ Скачиваю видео...")
+        ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
+        import tempfile,glob
+        with tempfile.TemporaryDirectory() as tmp:
+            out=f"{tmp}/video.%(ext)s"
+            try:
+                r=subprocess.run([ytdlp,
+                    "-f","best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
+                    "--no-playlist","--socket-timeout","30",
+                    "-o",out,"--no-part",text],
+                    capture_output=True,text=True,timeout=300,
+                    env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
+                if r.returncode!=0:
+                    send(vk,uid,f"❌ Ошибка:\n{(r.stderr or r.stdout)[-400:]}"); return
+                files=glob.glob(f"{tmp}/video.*")
+                if not files: send(vk,uid,"❌ Файл не найден"); return
+                vpath=files[0]; sz=os.path.getsize(vpath)/(1024*1024)
+                send(vk,uid,f"⬆️ Загружаю в VK ({sz:.1f} MB)...")
+                # Загружаем через пользовательский токен
+                user_session=vk_api.VkApi(token=cfg["user_token"])
+                upload=vk_api.VkUpload(user_session)
+                video=upload.video(vpath,name=f"YouTube ({sz:.1f} MB)",is_private=1)
+                owner_id=video["owner_id"]; video_id=video["video_id"]
+                att=f"video{owner_id}_{video_id}"
+                cur_kbd={"main":kbd_main,"tools":kbd_tools}.get(st,kbd_main)()
+                send_attach(vk,uid,f"📹 YouTube ({sz:.1f} MB)",att,cur_kbd)
+                db.log_command("vk",uid,f"yt {text[:80]}",f"{sz:.1f}MB",True)
+                # Удаляем видео из профиля после отправки
+                try:
+                    user_api=user_session.get_api()
+                    user_api.video.delete(video_id=video_id,owner_id=owner_id)
+                    logger.info(f"VK video {video_id} удалено из профиля")
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить видео {video_id}: {e}")
+            except subprocess.TimeoutExpired:
+                send(vk,uid,"⏱ Таймаут. Попробуй более короткое видео.")
+            except Exception as e:
+                send(vk,uid,f"❌ {e}")
+        return
 
     if text.lower() in ("начать","start","/start","меню"):
         states[uid]="main"; send(vk,uid,"👋 Панель управления ВМ:",kbd_main()); return
@@ -1988,48 +2019,7 @@ def handle(vk,uid,text):
             states[uid]="vkpanel"; send(vk,uid,"📡 Медиасервер:",kbd_vkpanel())
         elif text=="⚙️ Ядро":
             states[uid]="xui"; send(vk,uid,"⚙️ Ядро:",kbd_xui())
-        elif text=="📹 YouTube":
-            states[uid]="yt_url"; send(vk,uid,"📹 Отправь ссылку на YouTube-видео.\n⚠️ Лимит 45 MB | до 480p\n\nИли нажми «Назад»")
-        elif text=="« Назад":
-            states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main())
         else: send(vk,uid,"❓",kbd_tools())
-
-    elif st=="yt_url":
-        if text=="« Назад":
-            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools()); return
-        if not text.startswith("http"):
-            send(vk,uid,"❌ Введи корректную ссылку (http...):"); return
-        send(vk,uid,"⏳ Скачиваю видео...")
-        ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
-        import tempfile,glob
-        with tempfile.TemporaryDirectory() as tmp:
-            out=f"{tmp}/video.%(ext)s"
-            try:
-                r=subprocess.run([ytdlp,
-                    "-f","best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
-                    "--no-playlist","--socket-timeout","30",
-                    "-o",out,"--no-part",text],
-                    capture_output=True,text=True,timeout=300,
-                    env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
-                if r.returncode!=0:
-                    err=(r.stderr or r.stdout)[-400:]
-                    send(vk,uid,f"❌ Ошибка:\n{err}",kbd_tools())
-                    states[uid]="tools"; return
-                files=glob.glob(f"{tmp}/video.*")
-                if not files:
-                    send(vk,uid,"❌ Файл не найден",kbd_tools()); states[uid]="tools"; return
-                vpath=files[0]; sz=os.path.getsize(vpath)/(1024*1024)
-                send(vk,uid,f"⬆️ Загружаю в VK ({sz:.1f} MB)...")
-                upload=vk_api.VkUpload(vk_session_global)
-                video=upload.video(vpath,name=f"YouTube ({sz:.1f} MB)",is_private=1)
-                att=f"video{video['owner_id']}_{video['video_id']}"
-                send_attach(vk,uid,f"📹 YouTube ({sz:.1f} MB)",att,kbd_tools())
-                db.log_command("vk",uid,f"yt {text[:80]}",f"{sz:.1f}MB",True)
-            except subprocess.TimeoutExpired:
-                send(vk,uid,"⏱ Таймаут. Попробуй более короткое видео.",kbd_tools())
-            except Exception as e:
-                send(vk,uid,f"❌ {e}",kbd_tools())
-        states[uid]="tools"
 
     elif st=="tg_control":
         if text in ("🟢 TG активен","🔴 TG неактивен"):
@@ -2298,11 +2288,13 @@ update_config() {
         CUR_VK_TOK=$(jq -r '.vk.group_token' "$SHARED_CONFIG")
         CUR_VK_GRP=$(jq -r '.vk.group_id' "$SHARED_CONFIG")
         CUR_VK_USR=$(jq -r '.vk.allowed_users|join(",")' "$SHARED_CONFIG")
+        CUR_VK_UTOK=$(jq -r '.vk.user_token // ""' "$SHARED_CONFIG")
         echo -e "${BLUE}── 🟦 ВКонтакте ──${NC}"
         read -p "VK токен [Enter — не менять]: " NVK_TOK; NVK_TOK=${NVK_TOK:-$CUR_VK_TOK}
         read -p "VK группа ID [$CUR_VK_GRP]: " NVK_GRP; NVK_GRP=${NVK_GRP:-$CUR_VK_GRP}
         NVK_GRP="${NVK_GRP#-}"  # убираем минус если вставили из API
         read -p "VK пользователи [$CUR_VK_USR]: " NVK_USR; NVK_USR=${NVK_USR:-$CUR_VK_USR}
+        read -p "VK User Token для YouTube [Enter — не менять]: " NVK_UTOK; NVK_UTOK=${NVK_UTOK:-$CUR_VK_UTOK}
         echo ""
     fi
 
@@ -2328,7 +2320,7 @@ update_config() {
     VK_BLOCK='"vk":null'
     if is_installed vk; then
         VKU=$(echo "$NVK_USR"|tr ','  '\n'|sed 's/^[[:space:]]*//'|jq -R 'tonumber'|jq -s '.')
-        VK_BLOCK="\"vk\":{\"group_token\":\"$NVK_TOK\",\"group_id\":$NVK_GRP,\"allowed_users\":$VKU}"
+        VK_BLOCK="\"vk\":{\"group_token\":\"$NVK_TOK\",\"group_id\":$NVK_GRP,\"allowed_users\":$VKU,\"user_token\":\"$NVK_UTOK\"}"
     fi
 
     printf '{"installed":%s,"vm_id":"%s","folder_id":"%s","admin_pin":"%s",%s,%s}\n' \
