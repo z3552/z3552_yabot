@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v5.1
+# Автор: z3552[Reenpak]  |  yabot_installer v5.3
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -774,11 +774,14 @@ def kbd_main():
     return ReplyKeyboardMarkup(rows,resize_keyboard=True)
 
 def kbd_tools():
-    return ReplyKeyboardMarkup([
+    rows = [
         [KeyboardButton("💻 Терминал"),     KeyboardButton("🔑 Туннель")],
         [KeyboardButton("📡 Медиасервер"),  KeyboardButton("⚙️ Ядро")],
-        [KeyboardButton("« Назад")],
-    ],resize_keyboard=True)
+    ]
+    if not get_sensitive():
+        rows.append([KeyboardButton("📹 YouTube")])
+    rows.append([KeyboardButton("« Назад")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def kbd_schedule():
     s="🟢" if schedule_config.auto_start_enabled else "🔴"
@@ -1359,48 +1362,20 @@ async def xui_reset_pin(u,c):
 @check_access
 async def yt_begin(u,c):
     await u.message.reply_text(
-        "📹 Отправь ссылку на YouTube-видео.\n⚠️ Лимит 45 MB | до 480p\n\nИли /cancel для отмены",
+        "📹 Отправь ссылку на YouTube-видео — бот пришлёт её через встроенный плеер Telegram.\n\nИли /cancel для отмены",
         reply_markup=ReplyKeyboardRemove())
     return YT_URL_STATE
 
 @check_access
 async def yt_download(u,c):
-    import glob
     text=u.message.text.strip()
     uid=u.effective_user.id
     if not text.startswith("http"):
         await u.message.reply_text("❌ Введи корректную ссылку (http...):")
         return YT_URL_STATE
-    msg=await u.message.reply_text("⏳ Скачиваю видео…")
-    ytdlp=str(TG_DIR/"venv/bin/yt-dlp")
-    with tempfile.TemporaryDirectory() as tmp:
-        out=f"{tmp}/video.%(ext)s"
-        try:
-            r=subprocess.run([ytdlp,
-                "-f","best[filesize<45M][ext=mp4]/best[ext=mp4][height<=480]/best[height<=360]/worst",
-                "--max-filesize","45M","--no-playlist","--socket-timeout","30",
-                "-o",out,"--no-part",text],
-                capture_output=True,text=True,timeout=180,
-                env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
-            if r.returncode!=0:
-                err=(r.stderr or r.stdout)[-400:]
-                await msg.edit_text(f"❌ Ошибка:\n<pre>{err}</pre>",parse_mode="HTML",reply_markup=kbd_main())
-                return ConversationHandler.END
-            files=glob.glob(f"{tmp}/video.*")
-            if not files:
-                await msg.edit_text("❌ Файл не найден",reply_markup=kbd_main())
-                return ConversationHandler.END
-            vpath=files[0]; sz=os.path.getsize(vpath)/(1024*1024)
-            await msg.edit_text(f"⬆️ Отправляю ({sz:.1f} MB)…")
-            with open(vpath,"rb") as vf:
-                await u.message.reply_video(vf,caption=f"📹 YouTube ({sz:.1f} MB)",
-                                            reply_markup=kbd_main())
-            await msg.delete()
-            db.log_command("tg",uid,f"yt {text[:80]}",f"{sz:.1f}MB",True)
-        except subprocess.TimeoutExpired:
-            await msg.edit_text("⏱ Таймаут. Попробуй более короткое видео.",reply_markup=kbd_main())
-        except Exception as e:
-            await msg.edit_text(f"❌ {e}",reply_markup=kbd_main())
+    # Telegram автоматически встраивает YouTube через внутренний плеер
+    await u.message.reply_text(text, reply_markup=kbd_main())
+    db.log_command("tg",uid,f"yt {text[:80]}","embedded",True)
     return ConversationHandler.END
 
 # ── Cron ─────────────────────────────────────────────────────
@@ -1709,7 +1684,8 @@ def vk_upload_doc(uid,content_bytes,filename,title=""):
         f.write(content_bytes); fpath=f.name
     try:
         upload=vk_api.VkUpload(vk_session_global)
-        doc=upload.document(fpath,peer_id=uid,title=title or filename)
+        result=upload.document_message(fpath,peer_id=uid,title=title or filename)
+        doc=result[0]["doc"] if isinstance(result,list) else result.get("doc",result)
         return f"doc{doc['owner_id']}_{doc['id']}"
     finally:
         os.unlink(fpath)
@@ -2030,10 +2006,10 @@ def handle(vk,uid,text):
             out=f"{tmp}/video.%(ext)s"
             try:
                 r=subprocess.run([ytdlp,
-                    "-f","best[filesize<45M][ext=mp4]/best[ext=mp4][height<=480]/best[height<=360]/worst",
-                    "--max-filesize","45M","--no-playlist","--socket-timeout","30",
+                    "-f","best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
+                    "--no-playlist","--socket-timeout","30",
                     "-o",out,"--no-part",text],
-                    capture_output=True,text=True,timeout=180,
+                    capture_output=True,text=True,timeout=300,
                     env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
                 if r.returncode!=0:
                     err=(r.stderr or r.stdout)[-400:]
@@ -2043,9 +2019,10 @@ def handle(vk,uid,text):
                 if not files:
                     send(vk,uid,"❌ Файл не найден",kbd_tools()); states[uid]="tools"; return
                 vpath=files[0]; sz=os.path.getsize(vpath)/(1024*1024)
-                send(vk,uid,f"⬆️ Отправляю ({sz:.1f} MB)...")
-                att=vk_upload_doc(uid,open(vpath,"rb").read(),
-                    os.path.basename(vpath),"YouTube видео")
+                send(vk,uid,f"⬆️ Загружаю в VK ({sz:.1f} MB)...")
+                upload=vk_api.VkUpload(vk_session_global)
+                video=upload.video(vpath,name=f"YouTube ({sz:.1f} MB)",is_private=1)
+                att=f"video{video['owner_id']}_{video['video_id']}"
                 send_attach(vk,uid,f"📹 YouTube ({sz:.1f} MB)",att,kbd_tools())
                 db.log_command("vk",uid,f"yt {text[:80]}",f"{sz:.1f}MB",True)
             except subprocess.TimeoutExpired:
