@@ -1,12 +1,14 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v4.5
+# Автор: z3552[Reenpak]  |  yabot_installer v5.1
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+YABOT_VER=$(grep -oP 'yabot_installer v\K[0-9.]+' "$0" 2>/dev/null || echo '?')
 
 BOT_DIR="/opt/vm_manager"
 TG_DIR="$BOT_DIR/tg"
@@ -80,12 +82,13 @@ main_menu() {
     echo -e "  ${GREEN}7)${NC} Обновить конфигурацию"
     echo -e "  ${GREEN}8)${NC} 🔄 Обновить скрипты ботов"
     echo -e "  ${GREEN}9)${NC} ⬆️  Обновить установщик с GitHub"
+    echo -e "  ${GREEN}10)${NC} 🔃 Принудительное обновление с GitHub"
     echo -e "  ${RED}0)${NC} Выход"; echo ""
     read -p "Введите номер действия: " choice
     case $choice in
         1) install_bot ;; 2) uninstall_bot ;; 3) check_status ;;
         4) view_logs ;;   5) restart_bot ;;  6) setup_auto_power ;;
-        7) update_config ;; 8) update_bot_scripts ;; 9) update_from_github ;; 0) exit 0 ;;
+        7) update_config ;; 8) update_bot_scripts ;; 9) update_from_github ;; 10) update_from_github force ;; 0) exit 0 ;;
         *) echo -e "${RED}Неверный выбор!${NC}"; sleep 2; main_menu ;;
     esac
 }
@@ -2543,6 +2546,7 @@ GITHUB_INSTALLER="https://raw.githubusercontent.com/z3552/z3552_yabot/main/yabot
 GITHUB_VERSION="https://raw.githubusercontent.com/z3552/z3552_yabot/main/version.json"
 
 update_from_github() {
+    local FORCE="${1:-}"
     print_header
     echo -e "${CYAN}⬆️  ОБНОВЛЕНИЕ С GITHUB${NC}"; echo ""
     echo -e "${YELLOW}Источник:${NC} $GITHUB_RAW"; echo ""
@@ -2567,16 +2571,23 @@ for x in d.get('changelog',[]): print('  •',x)
     rm -f "$TMP_VER"
     echo -e "${YELLOW}Версия на GitHub:${NC}  v$NEW_VER"; echo ""
 
-    if [ "$CUR_VER" = "$NEW_VER" ]; then
+    if [ "$CUR_VER" = "$NEW_VER" ] && [ "$FORCE" != "force" ]; then
         echo -e "${GREEN}✅ Уже последняя версия (v$CUR_VER)${NC}"
-        echo ""; read -p "Enter..."; main_menu; return
+        echo ""
+        read -p "Принудительно переустановить текущую версию? (y/n): " force_confirm
+        if [ "$force_confirm" != "y" ]; then
+            echo -e "${GREEN}Отменено${NC}"; sleep 1; main_menu; return
+        fi
+        echo -e "${YELLOW}🔃 Принудительное обновление v$CUR_VER...${NC}"; echo ""
+    elif [ "$CUR_VER" = "$NEW_VER" ] && [ "$FORCE" = "force" ]; then
+        echo -e "${YELLOW}🔃 Принудительное обновление v$CUR_VER → v$NEW_VER${NC}"; echo ""
+    else
+        echo -e "${CYAN}Доступно: v$CUR_VER → v$NEW_VER${NC}"
+        [ -n "$CHANGELOG" ] && echo -e "${YELLOW}Изменения:${NC}\n$CHANGELOG"
+        echo ""
+        read -p "Скачать и применить? (y/n): " confirm
+        [ "$confirm" != "y" ] && echo -e "${GREEN}Отменено${NC}" && sleep 1 && main_menu && return
     fi
-
-    echo -e "${CYAN}Доступно: v$CUR_VER → v$NEW_VER${NC}"
-    [ -n "$CHANGELOG" ] && echo -e "${YELLOW}Изменения:${NC}\n$CHANGELOG"
-    echo ""
-    read -p "Скачать и применить? (y/n): " confirm
-    [ "$confirm" != "y" ] && echo -e "${GREEN}Отменено${NC}" && sleep 1 && main_menu && return
 
     # Скачиваем установщик
     TMP=$(mktemp)
