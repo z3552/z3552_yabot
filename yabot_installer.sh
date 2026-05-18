@@ -65,7 +65,7 @@ main_menu() {
             crontab -l 2>/dev/null | grep -v "# VM_BOT" | crontab - 2>/dev/null || true
     fi
     print_header
-    echo -e "  Версия: ${GREEN}v$VERSION${NC}"; echo ""
+    echo -e "  Версия: ${GREEN}v${YABOT_VER}${NC}"; echo ""
     echo -e "${YELLOW}Статус ботов:${NC}"
     svc_status_line "$TG_SERVICE" "  🔵 Telegram"
     svc_status_line "$VK_SERVICE" "  🟦 ВКонтакте"
