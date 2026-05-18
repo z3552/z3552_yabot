@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v5.0
+# Автор: z3552[Reenpak]  |  yabot_installer v4.5
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -600,7 +600,8 @@ def set_sensitive(val):
  CONSOLE_INPUT,
  WG_ADDUSER_NAME, WG_GETUSER_NAME, WG_DELUSER_NAME, WG_DELUSER_PIN,
  VKPANEL_STOP_PIN,
- XUI_STOP_PIN, XUI_PORT_PIN, XUI_PORT_INPUT, XUI_RESET_PIN) = range(14)
+ XUI_STOP_PIN, XUI_PORT_PIN, XUI_PORT_INPUT, XUI_RESET_PIN,
+ YT_URL_STATE) = range(15)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO,
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()])
@@ -837,7 +838,7 @@ def kbd_xui():
 
 # ── Существующие обработчики ──────────────────────────────────
 @check_access
-async def start_command(u,c): await u.message.reply_text("👋 Панель управления ВМ v5.0",reply_markup=kbd_main())
+async def start_command(u,c): await u.message.reply_text("👋 Панель управления ВМ v4.5",reply_markup=kbd_main())
 
 @check_access
 async def status_handler(u,c):
@@ -1349,6 +1350,54 @@ async def xui_reset_pin(u,c):
     await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
                         parse_mode="HTML",reply_markup=kbd_xui())
     db.log_command("tg",u.effective_user.id,"xui reset",out[:100],ok)
+    return ConversationHandler.END
+
+# ── YouTube download ─────────────────────────────────────────
+@check_access
+async def yt_begin(u,c):
+    await u.message.reply_text(
+        "📹 Отправь ссылку на YouTube-видео.\n⚠️ Лимит 45 MB | до 480p\n\nИли /cancel для отмены",
+        reply_markup=ReplyKeyboardRemove())
+    return YT_URL_STATE
+
+@check_access
+async def yt_download(u,c):
+    import glob
+    text=u.message.text.strip()
+    uid=u.effective_user.id
+    if not text.startswith("http"):
+        await u.message.reply_text("❌ Введи корректную ссылку (http...):")
+        return YT_URL_STATE
+    msg=await u.message.reply_text("⏳ Скачиваю видео…")
+    ytdlp=str(TG_DIR/"venv/bin/yt-dlp")
+    with tempfile.TemporaryDirectory() as tmp:
+        out=f"{tmp}/video.%(ext)s"
+        try:
+            r=subprocess.run([ytdlp,
+                "-f","best[filesize<45M][ext=mp4]/best[ext=mp4][height<=480]/best[height<=360]/worst",
+                "--max-filesize","45M","--no-playlist","--socket-timeout","30",
+                "-o",out,"--no-part",text],
+                capture_output=True,text=True,timeout=180,
+                env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
+            if r.returncode!=0:
+                err=(r.stderr or r.stdout)[-400:]
+                await msg.edit_text(f"❌ Ошибка:\n<pre>{err}</pre>",parse_mode="HTML",reply_markup=kbd_main())
+                return ConversationHandler.END
+            files=glob.glob(f"{tmp}/video.*")
+            if not files:
+                await msg.edit_text("❌ Файл не найден",reply_markup=kbd_main())
+                return ConversationHandler.END
+            vpath=files[0]; sz=os.path.getsize(vpath)/(1024*1024)
+            await msg.edit_text(f"⬆️ Отправляю ({sz:.1f} MB)…")
+            with open(vpath,"rb") as vf:
+                await u.message.reply_video(vf,caption=f"📹 YouTube ({sz:.1f} MB)",
+                                            reply_markup=kbd_main())
+            await msg.delete()
+            db.log_command("tg",uid,f"yt {text[:80]}",f"{sz:.1f}MB",True)
+        except subprocess.TimeoutExpired:
+            await msg.edit_text("⏱ Таймаут. Попробуй более короткое видео.",reply_markup=kbd_main())
+        except Exception as e:
+            await msg.edit_text(f"❌ {e}",reply_markup=kbd_main())
     return ConversationHandler.END
 
 # ── Cron ─────────────────────────────────────────────────────
