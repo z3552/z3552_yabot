@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v5.7
+# Автор: z3552[Reenpak]  |  yabot_installer v5.8
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -1803,19 +1803,13 @@ def handle(vk,uid,text):
                 # Загружаем через пользовательский токен
                 user_session=vk_api.VkApi(token=cfg["user_token"])
                 upload=vk_api.VkUpload(user_session)
-                video=upload.video(vpath,name=f"YouTube ({sz:.1f} MB)",is_private=1)
-                owner_id=video["owner_id"]; video_id=video["video_id"]
+                video=upload.video(vpath,name=f"YouTube ({sz:.1f} MB)",
+                                   group_id=cfg["group_id"],is_private=1)
+                owner_id=video.get("owner_id",-cfg["group_id"]); video_id=video["video_id"]
                 att=f"video{owner_id}_{video_id}"
                 cur_kbd={"main":kbd_main,"tools":kbd_tools}.get(st,kbd_main)()
                 send_attach(vk,uid,f"📹 YouTube ({sz:.1f} MB)",att,cur_kbd)
                 db.log_command("vk",uid,f"yt {text[:80]}",f"{sz:.1f}MB",True)
-                # Удаляем видео из профиля после отправки
-                try:
-                    user_api=user_session.get_api()
-                    user_api.video.delete(video_id=video_id,owner_id=owner_id)
-                    logger.info(f"VK video {video_id} удалено из профиля")
-                except Exception as e:
-                    logger.warning(f"Не удалось удалить видео {video_id}: {e}")
             except subprocess.TimeoutExpired:
                 send(vk,uid,"⏱ Таймаут. Попробуй более короткое видео.")
             except Exception as e:
