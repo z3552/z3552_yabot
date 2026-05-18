@@ -1,9 +1,7 @@
 {
-  "version": "4.6",
+  "version": "5.0",
   "date": "2026-05-18",
   "changelog": [
-    "Фикс отображения версии в меню",
-    "YouTube Downloader",
-    "Sensitive mode"
+    "v5.0 release"
   ]
 }
