@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v5.8
+# Автор: z3552[Reenpak]  |  yabot_installer v5.9
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -136,7 +136,7 @@ install_bot() {
     crontab -l 2>/dev/null | grep -v "# VM_BOT" | crontab - 2>/dev/null || true
     echo -e "${YELLOW}📦 Установка зависимостей...${NC}"
     apt update -qq
-    apt install -y python3 python3-pip python3-venv jq curl wget >/dev/null 2>&1
+    apt install -y python3 python3-pip python3-venv jq curl wget ffmpeg >/dev/null 2>&1
     echo -e "${GREEN}✅ Зависимости установлены${NC}"; echo ""
     install_yc_cli
     setup_yandex_cloud
@@ -1789,7 +1789,8 @@ def handle(vk,uid,text):
             out=f"{tmp}/video.%(ext)s"
             try:
                 r=subprocess.run([ytdlp,
-                    "-f","best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
+                    "-f","bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+                    "--merge-output-format","mp4",
                     "--no-playlist","--socket-timeout","30",
                     "-o",out,"--no-part",text],
                     capture_output=True,text=True,timeout=300,
