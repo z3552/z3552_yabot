@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v4.3
+# Автор: z3552[Reenpak]  |  yabot_installer v4.5
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -65,6 +65,7 @@ main_menu() {
             crontab -l 2>/dev/null | grep -v "# VM_BOT" | crontab - 2>/dev/null || true
     fi
     print_header
+    echo -e "  Версия: ${GREEN}v$VERSION${NC}"; echo ""
     echo -e "${YELLOW}Статус ботов:${NC}"
     svc_status_line "$TG_SERVICE" "  🔵 Telegram"
     svc_status_line "$VK_SERVICE" "  🟦 ВКонтакте"
@@ -525,7 +526,7 @@ create_tg_bot_structure() {
     echo -e "${YELLOW}🔵 Создание Telegram бота...${NC}"
     cd "$TG_DIR"; python3 -m venv venv; source venv/bin/activate
     pip install --quiet --upgrade pip
-    pip install --quiet python-telegram-bot==20.7 pytz Pillow qrcode
+    pip install --quiet python-telegram-bot==20.7 pytz Pillow qrcode yt-dlp
     deactivate
     create_tg_bot_script
     chmod +x "$TG_DIR/vm_bot.py"
@@ -536,7 +537,7 @@ create_vk_bot_structure() {
     echo -e "${YELLOW}🟦 Создание VK бота...${NC}"
     cd "$VK_DIR"; python3 -m venv venv; source venv/bin/activate
     pip install --quiet --upgrade pip
-    pip install --quiet vk_api Pillow qrcode
+    pip install --quiet vk_api Pillow qrcode yt-dlp
     deactivate
     create_vk_bot_script
     chmod +x "$VK_DIR/vk_bot.py"
@@ -577,6 +578,23 @@ BASE_DIR.mkdir(parents=True, exist_ok=True); TG_DIR.mkdir(parents=True, exist_ok
 sys.path.insert(0, str(BASE_DIR))
 import db_module as db
 db.init_db()
+
+SETTINGS_FILE = BASE_DIR / "settings.json"
+
+def get_sensitive():
+    try:
+        if SETTINGS_FILE.exists():
+            return json.load(open(SETTINGS_FILE)).get("sensitive_mode", False)
+    except: pass
+    return False
+
+def set_sensitive(val):
+    s = {}
+    try:
+        if SETTINGS_FILE.exists(): s = json.load(open(SETTINGS_FILE))
+    except: pass
+    s["sensitive_mode"] = val
+    with open(SETTINGS_FILE,"w") as f: json.dump(s,f)
 
 (SET_START_TIME, SET_STOP_TIME, SET_RETENTION, AWAIT_DELETE_PIN,
  CONSOLE_INPUT,
@@ -743,11 +761,12 @@ def check_access(func):
 def kbd_main():
     rows=[
         [KeyboardButton("📊 Статус"),       KeyboardButton("ℹ️ Информация")],
-        [KeyboardButton("▶️ Запустить"),    KeyboardButton("⏹ Остановить"),  KeyboardButton("🔄 Перезапустить")],
+        [KeyboardButton("▶️ Запустить"),    KeyboardButton("⏹ Остановить")],
+        [KeyboardButton("🔄 Перезапустить")],
         [KeyboardButton("⏰ Расписание"),   KeyboardButton("📋 История"),     KeyboardButton("⚙️ Настройки")],
-        [KeyboardButton("🔧 Инструменты")],
     ]
-    if config.vk_installed: rows[1].append(KeyboardButton("🟦 VK бот"))
+    if config.vk_installed: rows[2].append(KeyboardButton("🟦 VK бот"))
+    if not get_sensitive(): rows.append([KeyboardButton("🔧 Инструменты")])
     return ReplyKeyboardMarkup(rows,resize_keyboard=True)
 
 def kbd_tools():
@@ -784,7 +803,9 @@ def kbd_history():
     ],resize_keyboard=True)
 
 def kbd_settings():
+    lbl="🔒 Скрыть инструменты" if not get_sensitive() else "🔓 Показать инструменты"
     return ReplyKeyboardMarkup([
+        [KeyboardButton(lbl)],
         [KeyboardButton("🗑️ Удалить бота с сервера")],
         [KeyboardButton("« Назад")],
     ],resize_keyboard=True)
@@ -816,7 +837,7 @@ def kbd_xui():
 
 # ── Существующие обработчики ──────────────────────────────────
 @check_access
-async def start_command(u,c): await u.message.reply_text("👋 Панель управления ВМ v4.3",reply_markup=kbd_main())
+async def start_command(u,c): await u.message.reply_text("👋 Панель управления ВМ v4.5",reply_markup=kbd_main())
 
 @check_access
 async def status_handler(u,c):
@@ -985,7 +1006,15 @@ async def clear_history(u,c):
 
 @check_access
 async def settings_menu(u,c):
-    await u.message.reply_text("⚙️ <b>Настройки</b>",parse_mode="HTML",reply_markup=kbd_settings())
+    mode="🔒 Скрыт" if get_sensitive() else "🔓 Виден"
+    await u.message.reply_text(f"⚙️ <b>Настройки</b>\n\n🔧 Инструменты: <b>{mode}</b>",parse_mode="HTML",reply_markup=kbd_settings())
+
+@check_access
+async def toggle_sensitive(u,c):
+    val=not get_sensitive(); set_sensitive(val)
+    mode="скрыты 🔒" if val else "видны 🔓"
+    await u.message.reply_text(f"✅ Инструменты {mode}",reply_markup=kbd_settings())
+    await u.message.reply_text("↩️ Меню:",reply_markup=kbd_main())
 
 @check_access
 async def delete_bot_begin(u,c):
@@ -1407,6 +1436,10 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^🔃 Ядро-сброс$"),xui_reset_begin)],
         states={XUI_RESET_PIN:[MessageHandler(filters.TEXT&~filters.COMMAND,xui_reset_pin)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📹 YouTube$"),yt_begin)],
+        states={YT_URL_STATE:[MessageHandler(filters.TEXT&~filters.COMMAND,yt_download)]},
+        fallbacks=[CommandHandler("cancel",cancel_h)]))
 
     H=app.add_handler
     # ── Обычные обработчики ──
@@ -1428,6 +1461,7 @@ def main():
     H(MessageHandler(filters.Regex("^📊 Статистика БД$"),db_stats))
     H(MessageHandler(filters.Regex("^🗑️ Очистить историю$"),clear_history))
     H(MessageHandler(filters.Regex("^⚙️ Настройки$"),settings_menu))
+    H(MessageHandler(filters.Regex("^🔒 Скрыть инструменты$|^🔓 Показать инструменты$"),toggle_sensitive))
     # ── Новые разделы ──
     H(MessageHandler(filters.Regex("^🔑 Туннель$"),wg_menu))
     H(MessageHandler(filters.Regex("^👥 Пиры$"),wg_listusers))
@@ -1444,7 +1478,7 @@ def main():
     H(MessageHandler(filters.Regex("^🔧 Ядро-настройки$"),xui_settings))
     H(MessageHandler(filters.Regex("^🔧 Инструменты$"),tools_menu))
     H(MessageHandler(filters.Regex("^« Назад$"),back_main))
-    logger.info("TG бот запущен v4.2"); print("✅ TG бот запущен!")
+    logger.info("TG бот запущен v4.4"); print("✅ TG бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__=="__main__":
@@ -1481,6 +1515,22 @@ BASE_DIR.mkdir(parents=True,exist_ok=True); VK_DIR.mkdir(parents=True,exist_ok=T
 sys.path.insert(0,str(BASE_DIR))
 import db_module as db
 db.init_db()
+
+SETTINGS_FILE=BASE_DIR/"settings.json"
+
+def get_sensitive():
+    try:
+        if SETTINGS_FILE.exists(): return json.load(open(SETTINGS_FILE)).get("sensitive_mode",False)
+    except: pass
+    return False
+
+def set_sensitive(val):
+    s={}
+    try:
+        if SETTINGS_FILE.exists(): s=json.load(open(SETTINGS_FILE))
+    except: pass
+    s["sensitive_mode"]=val
+    with open(SETTINGS_FILE,"w") as f: json.dump(s,f)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s",level=logging.INFO,
     handlers=[logging.FileHandler(LOG_FILE),logging.StreamHandler()])
@@ -1640,17 +1690,21 @@ def kbd_main():
     rows=[
         [{"l":"📊 Статус","c":"primary"},{"l":"ℹ️ Информация","c":"primary"}],
         [{"l":"▶️ Запустить","c":"positive"},{"l":"⏹ Остановить","c":"negative"}],
-        [{"l":"🔄 Перезапустить"},{"l":"📋 История"},{"l":"⚙️ Настройки"}],
-        [{"l":"🔧 Инструменты","c":"primary"}],
+        [{"l":"🔄 Перезапустить"}],
+        [{"l":"⏰ Расписание"},{"l":"📋 История"},{"l":"⚙️ Настройки"}],
     ]
-    if cfg["tg_installed"]: rows[1].insert(0,{"l":"🔵 TG бот","c":"primary"})
+    if cfg["tg_installed"]: rows[2].append({"l":"🔵 TG бот","c":"primary"})
+    if not get_sensitive(): rows.append([{"l":"🔧 Инструменты","c":"primary"}])
     return _kbd(rows)
 
 def kbd_tools():
-    return _kbd([
+    rows=[
         [{"l":"💻 Терминал"},{"l":"🔑 Туннель","c":"primary"}],
         [{"l":"📡 Медиасервер"},{"l":"⚙️ Ядро","c":"primary"}],
-        [{"l":"« Назад"}]])
+    ]
+    if not get_sensitive(): rows.append([{"l":"📹 YouTube","c":"primary"}])
+    rows.append([{"l":"« Назад"}])
+    return _kbd(rows)
 
 def kbd_tg():
     a=svc_active(TG_SVC)
@@ -1668,7 +1722,8 @@ def kbd_hist():
         [{"l":"« Назад"}]])
 
 def kbd_settings():
-    return _kbd([[{"l":"🗑️ Удалить бота с сервера","c":"negative"}],[{"l":"« Назад"}]])
+    lbl="🔒 Скрыть инструменты" if not get_sensitive() else "🔓 Показать инструменты"
+    return _kbd([[{"l":lbl}],[{"l":"🗑️ Удалить бота с сервера","c":"negative"}],[{"l":"« Назад"}]])
 
 def kbd_console():
     return _kbd([[{"l":"« Назад"}]])
@@ -1905,9 +1960,47 @@ def handle(vk,uid,text):
             states[uid]="vkpanel"; send(vk,uid,"📡 Медиасервер:",kbd_vkpanel())
         elif text=="⚙️ Ядро":
             states[uid]="xui"; send(vk,uid,"⚙️ Ядро:",kbd_xui())
+        elif text=="📹 YouTube":
+            states[uid]="yt_url"; send(vk,uid,"📹 Отправь ссылку на YouTube-видео.\n⚠️ Лимит 45 MB | до 480p\n\nИли нажми «Назад»")
         elif text=="« Назад":
             states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main())
         else: send(vk,uid,"❓",kbd_tools())
+
+    elif st=="yt_url":
+        if text=="« Назад":
+            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools()); return
+        if not text.startswith("http"):
+            send(vk,uid,"❌ Введи корректную ссылку (http...):"); return
+        send(vk,uid,"⏳ Скачиваю видео...")
+        ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
+        import tempfile,glob
+        with tempfile.TemporaryDirectory() as tmp:
+            out=f"{tmp}/video.%(ext)s"
+            try:
+                r=subprocess.run([ytdlp,
+                    "-f","best[filesize<45M][ext=mp4]/best[ext=mp4][height<=480]/best[height<=360]/worst",
+                    "--max-filesize","45M","--no-playlist","--socket-timeout","30",
+                    "-o",out,"--no-part",text],
+                    capture_output=True,text=True,timeout=180,
+                    env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
+                if r.returncode!=0:
+                    err=(r.stderr or r.stdout)[-400:]
+                    send(vk,uid,f"❌ Ошибка:\n{err}",kbd_tools())
+                    states[uid]="tools"; return
+                files=glob.glob(f"{tmp}/video.*")
+                if not files:
+                    send(vk,uid,"❌ Файл не найден",kbd_tools()); states[uid]="tools"; return
+                vpath=files[0]; sz=os.path.getsize(vpath)/(1024*1024)
+                send(vk,uid,f"⬆️ Отправляю ({sz:.1f} MB)...")
+                att=vk_upload_doc(uid,open(vpath,"rb").read(),
+                    os.path.basename(vpath),"YouTube видео")
+                send_attach(vk,uid,f"📹 YouTube ({sz:.1f} MB)",att,kbd_tools())
+                db.log_command("vk",uid,f"yt {text[:80]}",f"{sz:.1f}MB",True)
+            except subprocess.TimeoutExpired:
+                send(vk,uid,"⏱ Таймаут. Попробуй более короткое видео.",kbd_tools())
+            except Exception as e:
+                send(vk,uid,f"❌ {e}",kbd_tools())
+        states[uid]="tools"
 
     elif st=="tg_control":
         if text in ("🟢 TG активен","🔴 TG неактивен"):
@@ -1950,7 +2043,12 @@ def handle(vk,uid,text):
         else: send(vk,uid,"❓",kbd_hist())
 
     elif st=="settings":
-        if text=="🗑️ Удалить бота с сервера":
+        if text in ("🔒 Скрыть инструменты","🔓 Показать инструменты"):
+            val=not get_sensitive(); set_sensitive(val)
+            mode="скрыты 🔒" if val else "видны 🔓"
+            send(vk,uid,f"✅ Инструменты {mode}",kbd_settings())
+            send(vk,uid,"↩️ Меню:",kbd_main())
+        elif text=="🗑️ Удалить бота с сервера":
             states[uid]="await_pin"
             send(vk,uid,"⚠️ Удаление бота с сервера!\nЭто удалит всё. Введите PIN:")
         elif text=="« Назад": states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main())
@@ -2052,7 +2150,7 @@ def main():
     if not cfg["group_id"]: print("❌ Нет ID группы VK"); return
     vk_session_global=vk_api.VkApi(token=cfg["group_token"])
     vk=vk_session_global.get_api(); longpoll=VkBotLongPoll(vk_session_global,cfg["group_id"])
-    logger.info(f"VK бот запущен v4.2. Group: {cfg['group_id']}"); print("✅ VK бот запущен!")
+    logger.info(f"VK бот запущен v4.4. Group: {cfg['group_id']}"); print("✅ VK бот запущен!")
     while True:
         try:
             for event in longpoll.listen():
@@ -2392,7 +2490,8 @@ $M $H * * * PATH=/usr/local/bin:/usr/bin:/bin $PY $SC --stop # VM_BOT"; }
 # ОБНОВЛЕНИЕ УСТАНОВЩИКА С GITHUB
 # ─────────────────────────────────────────────────────────────
 
-GITHUB_RAW="https://raw.githubusercontent.com/z3552/z3552_yabot/main/yabot_installer.sh"
+GITHUB_INSTALLER="https://raw.githubusercontent.com/z3552/z3552_yabot/main/yabot_installer.sh"
+GITHUB_VERSION="https://raw.githubusercontent.com/z3552/z3552_yabot/main/version.json"
 
 update_from_github() {
     print_header
@@ -2403,29 +2502,40 @@ update_from_github() {
     CUR_VER=$(grep -oP 'yabot_installer v\K[0-9.]+' "$0" 2>/dev/null || echo "?")
     echo -e "${YELLOW}Текущая версия:${NC} v$CUR_VER"
 
-    # Скачиваем во временный файл
-    TMP=$(mktemp)
-    echo -e "${YELLOW}Скачиваем...${NC}"
-    if ! curl -fsSL "$GITHUB_RAW" -o "$TMP" 2>/dev/null; then
-        echo -e "${RED}❌ Ошибка загрузки. Проверьте интернет.${NC}"
-        rm -f "$TMP"; echo ""; read -p "Enter..."; main_menu; return
+    # Проверяем version.json (маленький файл ~100 байт)
+    echo -e "${YELLOW}Проверяем version.json на GitHub...${NC}"
+    TMP_VER=$(mktemp)
+    if ! curl -fsSL "$GITHUB_VERSION" -o "$TMP_VER" 2>/dev/null; then
+        echo -e "${RED}❌ Ошибка: файл version.json не найден в репозитории.${NC}"
+        rm -f "$TMP_VER"; echo ""; read -p "Enter..."; main_menu; return
     fi
-
-    NEW_VER=$(grep -oP 'yabot_installer v\K[0-9.]+' "$TMP" 2>/dev/null || echo "?")
+    NEW_VER=$(python3 -c "import json; d=json.load(open('$TMP_VER')); print(d.get('version','?'))" 2>/dev/null || echo "?")
+    CHANGELOG=$(python3 -c "
+import json
+d=json.load(open('$TMP_VER'))
+for x in d.get('changelog',[]): print('  •',x)
+" 2>/dev/null || echo "")
+    rm -f "$TMP_VER"
     echo -e "${YELLOW}Версия на GitHub:${NC}  v$NEW_VER"; echo ""
 
     if [ "$CUR_VER" = "$NEW_VER" ]; then
         echo -e "${GREEN}✅ Уже последняя версия (v$CUR_VER)${NC}"
+        echo ""; read -p "Enter..."; main_menu; return
+    fi
+
+    echo -e "${CYAN}Доступно: v$CUR_VER → v$NEW_VER${NC}"
+    [ -n "$CHANGELOG" ] && echo -e "${YELLOW}Изменения:${NC}\n$CHANGELOG"
+    echo ""
+    read -p "Скачать и применить? (y/n): " confirm
+    [ "$confirm" != "y" ] && echo -e "${GREEN}Отменено${NC}" && sleep 1 && main_menu && return
+
+    # Скачиваем установщик
+    TMP=$(mktemp)
+    echo -e "${YELLOW}Загружаем установщик...${NC}"
+    if ! curl -fsSL "$GITHUB_INSTALLER" -o "$TMP" 2>/dev/null; then
+        echo -e "${RED}❌ Ошибка загрузки установщика.${NC}"
         rm -f "$TMP"; echo ""; read -p "Enter..."; main_menu; return
     fi
-
-    echo -e "${CYAN}Доступно обновление: v$CUR_VER → v$NEW_VER${NC}"; echo ""
-    read -p "Установить и обновить скрипты ботов? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-        rm -f "$TMP"; echo -e "${GREEN}Отменено${NC}"; sleep 1; main_menu; return
-    fi
-
-    # Заменяем установщик
     cp "$TMP" /root/yabot_installer.sh
     chmod +x /root/yabot_installer.sh
     ln -sf /root/yabot_installer.sh /usr/local/bin/yabot
