@@ -1,9 +1,9 @@
 {
-  "version": "4.5",
+  "version": "4.6",
   "date": "2026-05-18",
   "changelog": [
-    "YouTube Downloader (до 45 MB, 480p, sensitive-скрытие)",
-    "Версия в меню yabot",
-    "yt-dlp в обоих venv"
+    "Фикс отображения версии в меню",
+    "YouTube Downloader",
+    "Sensitive mode"
   ]
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v4.5
+# Автор: z3552[Reenpak]  |  yabot_installer v4.6
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -837,7 +837,7 @@ def kbd_xui():
 
 # ── Существующие обработчики ──────────────────────────────────
 @check_access
-async def start_command(u,c): await u.message.reply_text("👋 Панель управления ВМ v4.5",reply_markup=kbd_main())
+async def start_command(u,c): await u.message.reply_text("👋 Панель управления ВМ v4.6",reply_markup=kbd_main())
 
 @check_access
 async def status_handler(u,c):
