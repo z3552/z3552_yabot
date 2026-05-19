@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v7.5
+# Автор: z3552[Reenpak]  |  yabot_installer v7.7
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -1791,6 +1791,57 @@ def send_attach(vk,uid,text,attachment,kbd=None):
 YA_API="https://cloud-api.yandex.net/v1/disk/resources"
 YA_FOLDER="/yt_bot_videos"
 
+def yadisk_cleanup(token,max_age_days=7,min_free_pct=10):
+    """Удаляет файлы старше max_age_days и при нехватке места — самые старые."""
+    import requests as req
+    from datetime import datetime,timezone
+    h={"Authorization":f"OAuth {token}"}
+    deleted=0
+    try:
+        # Проверяем квоту
+        low_space=False
+        try:
+            ri=req.get("https://cloud-api.yandex.net/v1/disk",headers=h,timeout=30)
+            di=ri.json()
+            total=di.get("total_space",1); used=di.get("used_space",0)
+            low_space=(1-used/total)*100 < min_free_pct
+        except Exception: pass
+
+        # Получаем список файлов в папке
+        r=req.get(f"{YA_API}",headers=h,timeout=30,
+                  params={"path":YA_FOLDER,"fields":"_embedded.items","limit":"100"})
+        if r.status_code!=200: return 0
+        items=r.json().get("_embedded",{}).get("items",[])
+        now=datetime.now(timezone.utc)
+
+        # Сортируем по дате — самые старые первые
+        def get_created(x):
+            try: return datetime.fromisoformat(x.get("created","").replace("Z","+00:00"))
+            except: return now
+        items_sorted=sorted(items,key=get_created)
+
+        for item in items_sorted:
+            try:
+                created=get_created(item)
+                age_days=(now-created).days
+                if age_days>=max_age_days or low_space:
+                    req.delete(f"{YA_API}",headers=h,timeout=30,
+                               params={"path":item["path"],"permanently":"true"})
+                    deleted+=1
+                    logger.info(f"YaDisk cleanup: {item['name']} ({age_days}д)")
+                    # Перепроверяем место после удаления
+                    if low_space:
+                        ri2=req.get("https://cloud-api.yandex.net/v1/disk",
+                                    headers=h,timeout=30)
+                        di2=ri2.json()
+                        t2=di2.get("total_space",1); u2=di2.get("used_space",0)
+                        if (1-u2/t2)*100>=min_free_pct: low_space=False
+            except Exception as e:
+                logger.warning(f"YaDisk cleanup item error: {e}")
+    except Exception as e:
+        logger.error(f"YaDisk cleanup error: {e}")
+    return deleted
+
 def yadisk_upload(token,local_path,filename):
     """Загружает файл на Яндекс.Диск, делает публичным, возвращает ссылку."""
     import requests as req
@@ -1860,9 +1911,18 @@ def _yt_download_and_send(vk,uid,url,title,fmt,st):
             send(vk,uid,f"⬆️ Отправляю ({sz:.1f} MB)...")
 
             yadisk_token=cfg.get("yadisk_token","")
-            use_yadisk=yadisk_token and sz>1000  # Яндекс.Диск для файлов > 1 GB
+            use_yadisk=yadisk_token and sz>200  # Яндекс.Диск для файлов > 200 MB
+
+            if sz>200 and not yadisk_token:
+                send(vk,uid,
+                    f"❌ Файл {sz:.0f} MB — VK API не принимает больше 200 MB.\n"
+                    f"Добавь Yandex OAuth Token через пункт 7 меню для загрузки больших файлов.")
+                return
 
             if use_yadisk:
+                # Чистим диск перед загрузкой если мало места
+                try: yadisk_cleanup(yadisk_token,max_age_days=7,min_free_pct=15)
+                except Exception as e: logger.warning(f"pre-upload cleanup: {e}")
                 fname=f"{int(time.time())}_{os.path.basename(vpath)}"
                 pub_url=yadisk_upload(yadisk_token,vpath,fname)
                 if pub_url:
@@ -2285,6 +2345,19 @@ def main():
     vk_session_global=vk_api.VkApi(token=cfg["group_token"])
     vk=vk_session_global.get_api(); longpoll=VkBotLongPoll(vk_session_global,cfg["group_id"])
     logger.info(f"VK бот запущен v4.4. Group: {cfg['group_id']}"); print("✅ VK бот запущен!")
+
+    # Еженедельная очистка Яндекс.Диска
+    def _yadisk_weekly():
+        while True:
+            time.sleep(7*24*3600)
+            token=cfg.get("yadisk_token","")
+            if token:
+                try:
+                    n=yadisk_cleanup(token,max_age_days=7)
+                    logger.info(f"YaDisk еженедельная очистка: удалено {n} файлов")
+                except Exception as e:
+                    logger.error(f"YaDisk cleanup scheduler: {e}")
+    threading.Thread(target=_yadisk_weekly,daemon=True).start()
     while True:
         try:
             for event in longpoll.listen():
