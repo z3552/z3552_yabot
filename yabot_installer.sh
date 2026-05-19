@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v6.3
+# Автор: z3552[Reenpak]  |  yabot_installer v6.8
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -136,7 +136,7 @@ install_bot() {
     crontab -l 2>/dev/null | grep -v "# VM_BOT" | crontab - 2>/dev/null || true
     echo -e "${YELLOW}📦 Установка зависимостей...${NC}"
     apt update -qq
-    apt install -y python3 python3-pip python3-venv jq curl wget ffmpeg >/dev/null 2>&1
+    apt install -y python3 python3-pip python3-venv jq curl wget ffmpeg cpulimit >/dev/null 2>&1
     echo -e "${GREEN}✅ Зависимости установлены${NC}"; echo ""
     install_yc_cli
     setup_yandex_cloud
@@ -1771,18 +1771,26 @@ def send_attach(vk,uid,text,attachment,kbd=None):
 
 # ── Основной обработчик ───────────────────────────────────────
 def _yt_download_and_send(vk,uid,url,title,fmt,st):
-    """Скачивает YouTube видео, проверяет через ffprobe, отправляет как документ."""
+    """Скачивает YouTube видео с ограничением CPU, отправляет как документ."""
     ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
+
+    # Выбираем враппер для ограничения CPU
+    # cpulimit -l 60 -- ограничивает процесс до 60% CPU
+    cpulimit=["cpulimit","-l","60","--"] if subprocess.run(
+        ["which","cpulimit"],capture_output=True).returncode==0 else []
+
     send(vk,uid,f"⏳ Скачиваю «{title}»...")
     with tempfile.TemporaryDirectory() as tmp:
         out=f"{tmp}/video.%(ext)s"
         try:
-            r=subprocess.run([ytdlp,"-f",fmt,
+            cmd=cpulimit+["nice","-n","19","ionice","-c","3",
+                ytdlp,"-f",fmt,
                 "--merge-output-format","mp4",
-                "--postprocessor-args","ffmpeg:-c:v copy -c:a aac",
+                "--postprocessor-args","ffmpeg:-c:v copy -c:a aac -threads 2",
                 "--no-playlist","--socket-timeout","30",
-                "-o",out,"--no-part",url],
-                capture_output=True,text=True,timeout=300,
+                "-o",out,"--no-part",url]
+            r=subprocess.run(cmd,
+                capture_output=True,text=True,timeout=600,
                 env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
             if r.returncode!=0:
                 send(vk,uid,f"❌ Ошибка:\n{(r.stderr or r.stdout)[-400:]}"); return
@@ -1811,7 +1819,7 @@ def _yt_download_and_send(vk,uid,url,title,fmt,st):
             send_attach(vk,uid,f"📹 {title} ({sz:.1f} MB)",att,cur_kbd)
             db.log_command("vk",uid,f"yt {url[:80]}",f"{sz:.1f}MB",True)
         except subprocess.TimeoutExpired:
-            send(vk,uid,"⏱ Таймаут. Попробуй более короткое видео.")
+            send(vk,uid,"⏱ Таймаут. Видео слишком длинное.")
         except Exception as e:
             send(vk,uid,f"❌ {e}")
 
