@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v7.7
+# Автор: z3552[Reenpak]  |  yabot_installer v8.1
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -1730,12 +1730,18 @@ def kbd_main():
     return _kbd(rows)
 
 def kbd_tools():
-    return _kbd([
+    rows=[
         [{"l":"💻 Терминал"},{"l":"🔑 Туннель","c":"primary"}],
         [{"l":"📡 Медиасервер"},{"l":"⚙️ Ядро","c":"primary"}],
-        [{"l":"« Назад"}]])
+    ]
+    if cfg.get("yadisk_token"): rows.append([{"l":"📁 YaDisk видео","c":"primary"}])
+    rows.append([{"l":"« Назад"}])
+    return _kbd(rows)
 
-def kbd_tg():
+def kbd_yadisk():
+    return _kbd([
+        [{"l":"🗑 Удалить все видео","c":"negative"}],
+        [{"l":"« Назад"}]])
     a=svc_active(TG_SVC)
     return _kbd([
         [{"l":"🟢 TG активен" if a else "🔴 TG неактивен","c":"positive" if a else "negative"}],
@@ -1970,28 +1976,71 @@ def handle(vk,uid,text):
 
         if dubbed:
             dub_list="\n".join([f"{i+1}. {d['label']}" for i,d in enumerate(dubbed)])
-            send(vk,uid,f"🎬 {title}\n\nДоступны дубляжи:\n{dub_list}\n{len(dubbed)+1}. Оригинал\n\nОтветь номером:")
+            send(vk,uid,
+                f"🎬 {title}\n\n"
+                f"Доступны дубляжи:\n{dub_list}\n{len(dubbed)+1}. Оригинал\n\n"
+                f"Качество:\nA) 720p  B) 480p  C) 360p\n\n"
+                f"Ответь, например: 1A (RU дубляж 720p) или {len(dubbed)+1}C (оригинал 360p)\n"
+                f"Или просто номер — будет 720p по умолчанию:")
             states[uid]="yt_dub_choice"
             pending[uid]={"url":text,"dubbed":dubbed,"title":title}
             return
 
-        # Нет дубляжей — скачиваем сразу
-        _yt_download_and_send(vk,uid,text,title,"bestvideo+bestaudio/best",st)
+        # Нет дубляжей — спрашиваем только качество
+        send(vk,uid,
+            f"🎬 {title}\n\nВыбери качество:\n"
+            f"A) 720p\nB) 480p\nC) 360p\n\nОтветь буквой (или Enter — 720p):")
+        states[uid]="yt_quality_choice"
+        pending[uid]={"url":text,"title":title,"fmt_base":"bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best"}
         return
 
     elif st=="yt_dub_choice":
+        import re as _re
+        # Если ввод не число[+буква] — это кнопка меню, отменяем и переотправляем
+        if not _re.match(r'^\d+[ABCabc]?$',text.strip()):
+            pending.pop(uid,None); states[uid]="main"
+            handle(vk,uid,text); return
+
         data=pending.pop(uid,{})
         url=data.get("url",""); dubbed=data.get("dubbed",[]); title=data.get("title","YouTube")
-        try: choice=int(text.strip())-1
-        except: send(vk,uid,"❌ Введи номер из списка"); return
+        if not url: send(vk,uid,"❌ Сессия истекла, отправь ссылку заново",kbd_main()); states[uid]="main"; return
+
+        m=_re.match(r'^(\d+)([ABCabc]?)$',text.strip())
+        choice=int(m.group(1))-1; quality=(m.group(2).upper() or "A")
+        height={"A":"720","B":"480","C":"360"}.get(quality,"720")
+
         if choice==len(dubbed):
-            fmt="bestvideo+bestaudio/best"
+            fmt=f"bestvideo[vcodec^=avc1][height<={height}]+bestaudio/bestvideo[height<={height}]+bestaudio/best"
         elif 0<=choice<len(dubbed):
-            fmt=f"bestvideo+{dubbed[choice]['fid']}/bestvideo+bestaudio/best"
+            fid=dubbed[choice]['fid']
+            fmt=f"bestvideo[vcodec^=avc1][height<={height}]+{fid}/bestvideo[height<={height}]+{fid}/bestvideo+bestaudio/best"
         else:
-            send(vk,uid,"❌ Неверный номер"); return
+            pending[uid]=data; send(vk,uid,"❌ Неверный номер"); return
+
         states[uid]="main"
-        _yt_download_and_send(vk,uid,url,title,fmt,st)
+        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height}p)...\nБот остаётся доступен пока идёт загрузка.")
+        threading.Thread(target=_yt_download_and_send,
+            args=(vk,uid,url,title,fmt,"main"),daemon=True).start()
+        return
+
+    elif st=="yt_quality_choice":
+        import re as _re
+        if not _re.match(r'^[ABCabc]$',text.strip()):
+            pending.pop(uid,None); states[uid]="main"
+            handle(vk,uid,text); return
+
+        data=pending.pop(uid,{})
+        url=data.get("url",""); title=data.get("title","YouTube")
+        if not url: send(vk,uid,"❌ Сессия истекла",kbd_main()); states[uid]="main"; return
+
+        quality=text.strip().upper()
+        height={"A":"720","B":"480","C":"360"}.get(quality,"720")
+        fmt=f"bestvideo[vcodec^=avc1][height<={height}]+bestaudio/bestvideo[height<={height}]+bestaudio/best"
+
+        states[uid]="main"
+        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height}p)...\nБот остаётся доступен пока идёт загрузка.")
+        threading.Thread(target=_yt_download_and_send,
+            args=(vk,uid,url,title,fmt,"main"),daemon=True).start()
         return
 
     if text.lower() in ("начать","start","/start","меню"):
@@ -2194,7 +2243,49 @@ def handle(vk,uid,text):
             states[uid]="vkpanel"; send(vk,uid,"📡 Медиасервер:",kbd_vkpanel())
         elif text=="⚙️ Ядро":
             states[uid]="xui"; send(vk,uid,"⚙️ Ядро:",kbd_xui())
+        elif text=="📁 YaDisk видео":
+            token=cfg.get("yadisk_token","")
+            if not token: send(vk,uid,"❌ Yandex токен не задан",kbd_tools()); return
+            try:
+                import requests as req
+                from datetime import datetime,timezone
+                h={"Authorization":f"OAuth {token}"}
+                r=req.get(YA_API,headers=h,timeout=30,
+                          params={"path":YA_FOLDER,"fields":"_embedded.items","limit":"100"})
+                if r.status_code==404:
+                    send(vk,uid,"📁 Папка пуста — видео ещё не загружались",kbd_tools()); return
+                items=r.json().get("_embedded",{}).get("items",[])
+                if not items:
+                    send(vk,uid,"📁 Нет сохранённых видео",kbd_tools()); return
+                now=datetime.now(timezone.utc)
+                lines=[]; total_mb=0
+                for i,item in enumerate(sorted(items,key=lambda x:x.get("created",""),reverse=True),1):
+                    sz=item.get("size",0)/(1024*1024); total_mb+=sz
+                    try:
+                        cr=datetime.fromisoformat(item["created"].replace("Z","+00:00"))
+                        age=f"{(now-cr).days}д назад"
+                    except: age="?"
+                    lines.append(f"{i}. {item.get('name','?')[:40]}\n   📦 {sz:.1f} MB · 🕐 {age}")
+                msg=f"📁 Видео на Яндекс.Диске ({len(items)} шт, {total_mb:.0f} MB):\n\n"+"\n\n".join(lines)
+                states[uid]="yadisk_menu"
+                send(vk,uid,msg,kbd_yadisk())
+            except Exception as e:
+                send(vk,uid,f"❌ {e}",kbd_tools())
         else: send(vk,uid,"❓",kbd_tools())
+
+    elif st=="yadisk_menu":
+        if text=="🗑 Удалить все видео":
+            token=cfg.get("yadisk_token","")
+            if not token: send(vk,uid,"❌ Токен не задан",kbd_tools()); states[uid]="tools"; return
+            send(vk,uid,"⏳ Удаляю все видео...")
+            try:
+                n=yadisk_cleanup(token,max_age_days=0)
+                send(vk,uid,f"✅ Удалено {n} видео с Яндекс.Диска",kbd_tools())
+            except Exception as e:
+                send(vk,uid,f"❌ {e}",kbd_tools())
+            states[uid]="tools"
+        elif text=="« Назад":
+            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools())
 
     elif st=="tg_control":
         if text in ("🟢 TG активен","🔴 TG неактивен"):
