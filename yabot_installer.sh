@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v7.3
+# Автор: z3552[Reenpak]  |  yabot_installer v7.4
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -1830,14 +1830,14 @@ def _yt_download_and_send(vk,uid,url,title,fmt,st):
             # cpulimit -i — рекурсивно ограничивает все дочерние процессы (ffmpeg тоже)
             cpulimit_ok=subprocess.run(["which","cpulimit"],capture_output=True).returncode==0
             cmd=(["cpulimit","-l","60","--"] if cpulimit_ok else [])+\
-                ["nice","-n","19","ionice","-c","3",
-                 ytdlp,"-f",fmt,
+                [ytdlp,"-f",fmt,
                  "--merge-output-format","mp4",
                  "--postprocessor-args","ffmpeg:-c:v copy -c:a aac -threads 1",
                  "--no-playlist","--socket-timeout","30",
                  "-o",out,"--no-part",url]
             r=subprocess.run(cmd,
                 capture_output=True,text=True,timeout=600,
+                preexec_fn=lambda: os.nice(19),
                 env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
             if r.returncode!=0:
                 send(vk,uid,f"❌ Ошибка:\n{(r.stderr or r.stdout)[-400:]}"); return
