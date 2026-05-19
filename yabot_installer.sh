@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v8.1
+# Автор: z3552[Reenpak]  |  yabot_installer v8.4
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -284,6 +284,26 @@ get_user_inputs_vk() {
     echo -e "${YELLOW}Яндекс.Диск OAuth токен (для отправки видео >200 MB).${NC}"
     echo -e "${YELLOW}Получить: https://oauth.yandex.ru → создать приложение → права cloud_api:disk.write,read${NC}"
     read -p "Yandex OAuth Token (Enter — пропустить): " YADISK_TOKEN
+    echo ""
+    if [ -n "$YADISK_TOKEN" ]; then
+        echo -e "${CYAN}══════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}📤 SSH загрузка на Яндекс.Диск через ВМ Яндекс.Облака${NC}"
+        echo -e "${YELLOW}IP ВМ определится автоматически. Нужны SSH юзер и ключ.${NC}"; echo ""
+        echo -e "${YELLOW}SSH ключи найденные в ~/.ssh/:${NC}"
+        ls ~/.ssh/ 2>/dev/null | grep -v '\.pub$' | grep -v known_hosts | grep -v authorized_keys \
+            | sed 's/^/  - ~\/.ssh\//' || echo "  (не найдено)"
+        echo ""
+        read -p "SSH пользователь для ВМ [ubuntu]: " YC_VM_SSH_USER
+        YC_VM_SSH_USER="${YC_VM_SSH_USER:-ubuntu}"
+        read -p "Путь к SSH ключу (Enter — без SSH, загрузка с NL VPS): " YC_VM_SSH_KEY
+        if [ -n "$YC_VM_SSH_KEY" ]; then
+            echo -e "${GREEN}✅ SSH загрузка: ${YC_VM_SSH_USER}@<vm_ip_из_yc> ключ ${YC_VM_SSH_KEY}${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Без SSH ключа — загрузка пойдёт напрямую с NL VPS${NC}"
+        fi
+    else
+        YC_VM_SSH_USER="ubuntu"; YC_VM_SSH_KEY=""
+    fi
     echo -e "${GREEN}✅ Данные VK собраны${NC}"; echo ""
 }
 
@@ -321,14 +341,14 @@ create_shared_config() {
 
     if $INSTALL_TG; then
         TG_USERS_JSON=$(echo "$TG_USER_ID"|tr ','  '\n'|sed 's/^[[:space:]]*//'|jq -R 'tonumber'|jq -s '.')
-        TG_BLOCK="\"tg\":{\"bot_token\":\"$TG_BOT_TOKEN\",\"allowed_users\":$TG_USERS_JSON}"
+        TG_BLOCK='"tg":{"bot_token":"'"$TG_BOT_TOKEN"'","allowed_users":'"$TG_USERS_JSON"'}'
     else
         TG_BLOCK='"tg":null'
     fi
 
     if $INSTALL_VK; then
         VK_USERS_JSON=$(echo "$VK_USER_IDS"|tr ','  '\n'|sed 's/^[[:space:]]*//'|jq -R 'tonumber'|jq -s '.')
-        VK_BLOCK="\"vk\":{\"group_token\":\"$VK_TOKEN\",\"group_id\":$VK_GROUP_ID,\"allowed_users\":$VK_USERS_JSON,\"user_token\":\"$VK_USER_TOKEN\",\"yadisk_token\":\"$YADISK_TOKEN\"}"
+        VK_BLOCK='"vk":{"group_token":"'"$VK_TOKEN"'","group_id":'"$VK_GROUP_ID"',"allowed_users":'"$VK_USERS_JSON"',"user_token":"'"$VK_USER_TOKEN"'","yadisk_token":"'"$YADISK_TOKEN"'","yadisk_ssh_user":"'"$YC_VM_SSH_USER"'","yadisk_ssh_key":"'"$YC_VM_SSH_KEY"'"}'
     else
         VK_BLOCK='"vk":null'
     fi
@@ -779,6 +799,7 @@ def kbd_tools():
     return ReplyKeyboardMarkup([
         [KeyboardButton("💻 Терминал"),     KeyboardButton("🔑 Туннель")],
         [KeyboardButton("📡 Медиасервер"),  KeyboardButton("⚙️ Ядро")],
+        [KeyboardButton("🎬 YouTube")],
         [KeyboardButton("« Назад")],
     ],resize_keyboard=True)
 
@@ -1457,6 +1478,7 @@ def main():
     H=app.add_handler
     # ── YouTube: автодетект ссылок ──
     H(MessageHandler(filters.Regex(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+'),yt_inline))
+    H(MessageHandler(filters.Regex("^🎬 YouTube$"),yt_tools_menu))
     # ── Обычные обработчики ──
     H(MessageHandler(filters.Regex("^📊 Статус$"),status_handler))
     H(MessageHandler(filters.Regex("^ℹ️ Информация$"),info_handler))
@@ -1516,7 +1538,10 @@ create_vk_bot_script() {
     cat > "$VK_DIR/vk_bot.py" << 'VKEOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""VK бот управления ВМ Яндекс.Облака. v4.2"""
+"""VK бот управления ВМ Яндекс.Облака. v5.0
+Новое: SSH-загрузка YouTube через NL VPS, подписки на каналы,
+       поиск YouTube, система ролей/whitelist, изоляция VM-контроля.
+"""
 
 import json,os,random,subprocess,logging,time,sys,threading,io,re,tempfile,glob
 from pathlib import Path
@@ -1525,6 +1550,7 @@ from vk_api.bot_longpoll import VkBotLongPoll,VkBotEventType
 
 BASE_DIR=Path("/opt/vm_manager"); VK_DIR=BASE_DIR/"vk"
 CONFIG_FILE=BASE_DIR/"config.json"; LOG_FILE=VK_DIR/"bot.log"
+ADMIN_FILE=BASE_DIR/"admins.json"; YT_SUBS_FILE=BASE_DIR/"yt_subs.json"
 BASE_DIR.mkdir(parents=True,exist_ok=True); VK_DIR.mkdir(parents=True,exist_ok=True)
 
 sys.path.insert(0,str(BASE_DIR))
@@ -1554,73 +1580,249 @@ logger=logging.getLogger(__name__)
 def load_cfg():
     with open(CONFIG_FILE) as f: d=json.load(f)
     v=d.get("vk") or {}
+    ssh=d.get("ssh_vps") or {}
     return {"vm_id":d.get("vm_id",""),"folder_id":d.get("folder_id",""),
             "admin_pin":d.get("admin_pin",""),
             "group_token":v.get("group_token",""),"group_id":int(v.get("group_id",0)),
             "allowed_users":[int(u) for u in v.get("allowed_users",[])],
             "user_token":v.get("user_token",""),
             "yadisk_token":v.get("yadisk_token",""),
-            "tg_installed":"tg" in (d.get("installed") or [])}
+            "tg_installed":"tg" in (d.get("installed") or []),
+            "ssh_host":ssh.get("host",""),"ssh_user":ssh.get("user","root"),
+            "ssh_port":int(ssh.get("port",22)),"ssh_key":ssh.get("key_path","")}
 
 cfg=load_cfg()
-# Состояния пользователей
 states:dict[int,str]={}
-# Временные данные между состояниями (имена для WG/xui)
 pending:dict[int,dict]={}
-# Глобальная сессия VK (инициализируется в main)
 vk_session_global=None
 
-class VM:
-    E={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin:/root/yandex-cloud/bin"}
-    @staticmethod
-    def run(cmd,t=60):
+# ── Система ролей ─────────────────────────────────────────────
+def load_admin():
+    if ADMIN_FILE.exists():
+        try: return json.load(open(ADMIN_FILE))
+        except: pass
+    # Первый запуск — VM-функции только для владельца
+    return {"extra_users":[],"user_labels":{},
+            "disabled_features":{},
+            "global_disabled":["vm_control","terminal","tunnel","xui","vkpanel"]}
+
+def save_admin(data):
+    with open(ADMIN_FILE,"w") as f: json.dump(data,f,indent=2,ensure_ascii=False)
+
+def is_admin(uid):
+    return uid in cfg["allowed_users"]
+
+def get_all_users():
+    base=list(cfg["allowed_users"])
+    extra=load_admin().get("extra_users",[])
+    return list(dict.fromkeys(base+[int(u) for u in extra]))
+
+def user_can(uid,feature):
+    if is_admin(uid): return True
+    data=load_admin()
+    if feature in data.get("global_disabled",[]): return False
+    return feature not in data.get("disabled_features",{}).get(str(uid),[])
+
+def resolve_vk_user(vk_obj,page_str):
+    """VK page URL/username → (uid, display_name)"""
+    s=re.sub(r'https?://(www\.)?vk\.com/','',page_str.strip()).strip('/').split('?')[0].strip()
+    if s.startswith('id') and s[2:].isdigit():
+        uid=int(s[2:])
         try:
-            r=subprocess.run(cmd,capture_output=True,text=True,timeout=t,env=VM.E)
+            info=vk_obj.users.get(user_ids=uid,fields="first_name,last_name")
+            name=f"{info[0]['first_name']} {info[0]['last_name']}" if info else s
+        except: name=s
+        return uid,name
+    try:
+        r=vk_obj.utils.resolveScreenName(screen_name=s)
+        if r and r.get("type")=="user":
+            uid=r["object_id"]
+            info=vk_obj.users.get(user_ids=uid,fields="first_name,last_name")
+            name=f"{info[0]['first_name']} {info[0]['last_name']}" if info else s
+            return uid,name
+    except Exception as e:
+        logger.warning(f"resolve_vk_user: {e}")
+    return None,None
+
+# ── YouTube подписки ──────────────────────────────────────────
+def load_yt_subs():
+    if YT_SUBS_FILE.exists():
+        try: return json.load(open(YT_SUBS_FILE))
+        except: pass
+    return {"channels":{}}
+
+def save_yt_subs(data):
+    with open(YT_SUBS_FILE,"w") as f: json.dump(data,f,indent=2,ensure_ascii=False)
+
+def yt_get_channel_info(channel_url):
+    """Возвращает (channel_id, channel_name, latest_5_videos)"""
+    try:
+        import yt_dlp as yt
+        opts={"quiet":True,"no_warnings":True,"extract_flat":"in_playlist",
+              "playlist_items":"1-5","noplaylist":False}
+        with yt.YoutubeDL(opts) as ydl:
+            info=ydl.extract_info(channel_url,download=False)
+        cid=info.get("channel_id") or info.get("id","")
+        cname=info.get("channel") or info.get("title","")
+        videos=[]
+        for e in (info.get("entries") or [])[:5]:
+            if e:
+                videos.append({"id":e.get("id",""),"title":e.get("title","")[:60],
+                                "url":e.get("url") or f"https://youtu.be/{e.get('id','')}"})
+        return cid,cname,videos
+    except Exception as e:
+        logger.warning(f"yt_get_channel_info: {e}")
+        return None,None,[]
+
+def yt_search(query,n=5):
+    """Поиск YouTube. Возвращает список [{id,title,url,channel}]"""
+    try:
+        import yt_dlp as yt
+        opts={"quiet":True,"no_warnings":True,"extract_flat":True,"noplaylist":True}
+        with yt.YoutubeDL(opts) as ydl:
+            info=ydl.extract_info(f"ytsearch{n}:{query}",download=False)
+        results=[]
+        for e in (info.get("entries") or []):
+            if e:
+                results.append({"id":e.get("id",""),"title":e.get("title","")[:60],
+                                 "url":f"https://youtu.be/{e.get('id','')}",
+                                 "channel":e.get("channel","")[:30]})
+        return results
+    except Exception as e:
+        logger.warning(f"yt_search: {e}")
+        return []
+
+def _yt_check_subscriptions_thread():
+    """Фоновый поток: каждые 30 мин проверяет новые видео."""
+    time.sleep(60)  # старт через минуту после запуска
+    while True:
+        try:
+            if vk_session_global is None: time.sleep(60); continue
+            vk=vk_session_global.get_api()
+            data=load_yt_subs()
+            changed=False
+            for cid,ch in data.get("channels",{}).items():
+                try:
+                    _,_,videos=yt_get_channel_info(ch.get("url",""))
+                    if not videos: continue
+                    latest_id=videos[0]["id"]
+                    if latest_id and latest_id!=ch.get("last_video_id"):
+                        # новое видео!
+                        v=videos[0]
+                        msg=(f"🔔 Новое видео на канале {ch.get('name',cid)}!\n\n"
+                             f"🎬 {v['title']}\n🔗 {v['url']}")
+                        for uid in ch.get("subscribers",[]):
+                            try: vk.messages.send(user_id=uid,message=msg,random_id=random.randint(0,2**31))
+                            except: pass
+                        ch["last_video_id"]=latest_id; changed=True
+                        logger.info(f"YT subs notify: {ch.get('name',cid)} → {v['title']}")
+                except Exception as e:
+                    logger.warning(f"subs check {cid}: {e}")
+            if changed: save_yt_subs(data)
+        except Exception as e:
+            logger.error(f"subs thread: {e}")
+        time.sleep(1800)  # 30 минут
+
+# ── SSH-загрузка YouTube ──────────────────────────────────────
+def _yt_download_via_ssh(url,fmt,tmp_dir):
+    """Скачивает через SSH на NL VPS, SCP обратно. Возвращает (local_path, error_str)."""
+    host=cfg.get("ssh_host",""); user=cfg.get("ssh_user","root")
+    port=str(cfg.get("ssh_port",22)); key=cfg.get("ssh_key","")
+    if not host: return None,"SSH не настроен"
+
+    remote_tmp=f"/tmp/ytdl_{os.getpid()}_{int(time.time())}"
+    remote_out=f"{remote_tmp}/%(title)s.%(ext)s"
+
+    ssh_opts=["-o","StrictHostKeyChecking=no","-o","ConnectTimeout=30",
+              "-o","BatchMode=yes","-p",port]
+    if key: ssh_opts+=["-i",key]
+    ssh_base=["ssh"]+ssh_opts+[f"{user}@{host}"]
+
+    # yt-dlp на NL VPS (тот же путь)
+    ytdlp_remote="/opt/vm_manager/tg/venv/bin/yt-dlp"
+    if_ytdlp=subprocess.run(ssh_base+[f"test -f {ytdlp_remote} && echo ok || echo missing"],
+                            capture_output=True,text=True,timeout=15)
+    if "missing" in if_ytdlp.stdout:
+        # Попробуем системный yt-dlp
+        ytdlp_remote="yt-dlp"
+
+    try:
+        subprocess.run(ssh_base+[f"mkdir -p '{remote_tmp}'"],timeout=15,capture_output=True)
+        yt_cmd=(f'{ytdlp_remote} -f "{fmt}" --merge-output-format mp4 '
+                f'--postprocessor-args "ffmpeg:-c:v libx264 -preset ultrafast -crf 23 -c:a aac -threads 2" '
+                f'--no-playlist --socket-timeout 30 -o "{remote_out}" --no-part '
+                f'--restrict-filenames "{url}"')
+        r=subprocess.run(ssh_base+[yt_cmd],capture_output=True,text=True,timeout=900)
+        if r.returncode!=0:
+            subprocess.run(ssh_base+[f"rm -rf '{remote_tmp}'"],timeout=15,capture_output=True)
+            return None,(r.stderr or r.stdout)[-400:]
+
+        # Найти скачанный файл
+        ls_r=subprocess.run(ssh_base+[f"ls '{remote_tmp}/'"],capture_output=True,text=True,timeout=15)
+        remote_files=[f.strip() for f in ls_r.stdout.strip().split("\n") if f.strip() and f.strip().endswith(".mp4")]
+        if not remote_files:
+            remote_files=[f.strip() for f in ls_r.stdout.strip().split("\n") if f.strip()]
+        if not remote_files:
+            subprocess.run(ssh_base+[f"rm -rf '{remote_tmp}'"],timeout=15,capture_output=True)
+            return None,"Файл не найден на VPS после скачивания"
+
+        remote_file=f"{remote_tmp}/{remote_files[0]}"
+        local_file=os.path.join(tmp_dir,remote_files[0])
+
+        scp_opts=["-o","StrictHostKeyChecking=no","-P",port]
+        if key: scp_opts+=["-i",key]
+        r2=subprocess.run(["scp"]+scp_opts+[f"{user}@{host}:{remote_file}",local_file],
+                          capture_output=True,text=True,timeout=900)
+        subprocess.run(ssh_base+[f"rm -rf '{remote_tmp}'"],timeout=15,capture_output=True)
+        if r2.returncode!=0: return None,r2.stderr[-300:]
+        return local_file,None
+    except subprocess.TimeoutExpired:
+        try: subprocess.run(ssh_base+[f"rm -rf '{remote_tmp}'"],timeout=10,capture_output=True)
+        except: pass
+        return None,"⏱ Таймаут SSH-загрузки"
+    except Exception as e:
+        return None,str(e)
+
+class VM:
+    _ENV={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin:/root/yandex-cloud/bin"}
+    @staticmethod
+    def _run(cmd,t=60):
+        try:
+            r=subprocess.run(cmd,capture_output=True,text=True,timeout=t,env=VM._ENV)
             return (True,r.stdout.strip()) if r.returncode==0 else (False,r.stderr.strip())
         except subprocess.TimeoutExpired: return False,f"Таймаут {t}с"
         except Exception as e: return False,str(e)
     @staticmethod
     def status():
-        ok,out=VM.run(["yc","compute","instance","get",cfg["vm_id"],"--format","json"])
+        ok,out=VM._run(["yc","compute","instance","get",cfg["vm_id"],"--format","json"])
         if ok:
             try: d=json.loads(out); return True,d.get("status","UNKNOWN"),d
             except: pass
         return False,out,None
     @staticmethod
     def start():
+        import time as _t
         ok,s,_=VM.status()
         if not ok: return False,f"Нет статуса: {s}"
         if s=="RUNNING": return True,"ВМ уже запущена"
-        if s=="STARTING": return True,"ВМ уже запускается"
-        if s not in ["STOPPED","STOPPING"]: return False,f"Запуск невозможен: {s}"
-        if s=="STOPPING":
-            for _ in range(12):
-                time.sleep(10); ok,s,_=VM.status()
-                if ok and s=="STOPPED": break
-            else: return False,"ВМ не остановилась"
-        ok,out=VM.run(["yc","compute","instance","start",cfg["vm_id"]])
-        return (True,"✅ ВМ запущена") if ok else (False,f"Ошибка: {out}")
+        if s not in ["STOPPED","STOPPING"]: return False,f"Невозможно: {s}"
+        ok,out=VM._run(["yc","compute","instance","start",cfg["vm_id"]])
+        return (True,"✅ ВМ запущена") if ok else (False,f"❌ {out}")
     @staticmethod
     def stop():
         ok,s,_=VM.status()
         if not ok: return False,f"Нет статуса: {s}"
         if s=="STOPPED": return True,"ВМ уже остановлена"
-        if s=="STOPPING": return True,"ВМ уже останавливается"
-        if s not in ["RUNNING","STARTING"]: return False,f"Остановка невозможна: {s}"
-        if s=="STARTING":
-            for _ in range(12):
-                time.sleep(10); ok,s,_=VM.status()
-                if ok and s=="RUNNING": break
-            else: return False,"ВМ не запустилась"
-        ok,out=VM.run(["yc","compute","instance","stop",cfg["vm_id"]])
-        return (True,"✅ ВМ остановлена") if ok else (False,f"Ошибка: {out}")
+        if s not in ["RUNNING","STARTING"]: return False,f"Невозможно: {s}"
+        ok,out=VM._run(["yc","compute","instance","stop",cfg["vm_id"]])
+        return (True,"✅ ВМ остановлена") if ok else (False,f"❌ {out}")
     @staticmethod
     def restart():
         ok,s,_=VM.status()
         if not ok: return False,f"Нет статуса: {s}"
         if s!="RUNNING": return False,f"Нужен RUNNING, сейчас: {s}"
-        ok,out=VM.run(["yc","compute","instance","restart",cfg["vm_id"]])
-        return (True,"✅ ВМ перезапускается") if ok else (False,f"Ошибка: {out}")
+        ok,out=VM._run(["yc","compute","instance","restart",cfg["vm_id"]])
+        return (True,"✅ ВМ перезапускается") if ok else (False,f"❌ {out}")
     @staticmethod
     def info():
         ok,s,d=VM.status()
@@ -1651,7 +1853,6 @@ def ctrl_svc(svc,action):
             if r.returncode==0 else (False,f"❌ {r.stderr.strip()}")
     except Exception as e: return False,f"❌ {e}"
 
-# ── Утилиты для новых разделов ───────────────────────────────
 def run_cmd_vk(cmd_str,timeout=30):
     try:
         r=subprocess.run(cmd_str,shell=True,capture_output=True,text=True,timeout=timeout,
@@ -1668,34 +1869,22 @@ def run_xui_vk(n,timeout=20):
     return run_cmd_vk(f'echo "{n}" | x-ui',timeout)
 
 def vk_upload_doc(uid,fpath,filename,title=""):
-    """Загружает файл как VK-документ (принимает путь, не байты)."""
     import requests as req
     if vk_session_global is None: raise RuntimeError("vk_session_global не инициализирован")
     vk=vk_session_global.get_api()
-
-    # Получаем URL сервера загрузки
     upload_info=vk.docs.getMessagesUploadServer(peer_id=uid)
     upload_url=upload_info["upload_url"]
-
-    # Загружаем потоком без загрузки в RAM, таймаут 10 минут
     with open(fpath,"rb") as fp:
-        r=req.post(upload_url,
-            files={"file":(filename,fp,"application/octet-stream")},
-            timeout=600)
+        r=req.post(upload_url,files={"file":(filename,fp,"application/octet-stream")},timeout=600)
     r.raise_for_status()
-    if not r.text.strip():
-        raise RuntimeError("VK upload server вернул пустой ответ")
+    if not r.text.strip(): raise RuntimeError("VK upload server вернул пустой ответ")
     data=r.json()
-    if "file" not in data:
-        raise RuntimeError(f"VK upload error: {data}")
-
-    # Сохраняем документ
+    if "file" not in data: raise RuntimeError(f"VK upload error: {data}")
     saved=vk.docs.save(file=data["file"],title=title or filename)
     doc=saved[0] if isinstance(saved,list) else saved.get("doc",saved)
     return f"doc{doc['owner_id']}_{doc['id']}"
 
 def vk_upload_photo(uid,png_bytes):
-    """Загружает PNG-байты как VK-фото, возвращает attachment-строку."""
     if vk_session_global is None: raise RuntimeError("vk_session_global не инициализирован")
     with tempfile.NamedTemporaryFile(delete=False,suffix=".png") as f:
         f.write(png_bytes); fpath=f.name
@@ -1729,23 +1918,26 @@ def kbd_main():
     if not get_sensitive(): rows.append([{"l":"🔧 Инструменты","c":"primary"}])
     return _kbd(rows)
 
-def kbd_tools():
+def kbd_tools(uid=None):
     rows=[
         [{"l":"💻 Терминал"},{"l":"🔑 Туннель","c":"primary"}],
         [{"l":"📡 Медиасервер"},{"l":"⚙️ Ядро","c":"primary"}],
+        [{"l":"🎬 YouTube","c":"positive"}],
     ]
-    if cfg.get("yadisk_token"): rows.append([{"l":"📁 YaDisk видео","c":"primary"}])
+    if cfg.get("yadisk_token"): rows[2].append({"l":"📁 YaDisk видео","c":"primary"})
     rows.append([{"l":"« Назад"}])
     return _kbd(rows)
 
 def kbd_yadisk():
+    return _kbd([[{"l":"🗑 Удалить все видео","c":"negative"}],[{"l":"« Назад"}]])
+
+def kbd_youtube():
+    ssh_ok=bool(cfg.get("ssh_host",""))
+    ssh_lbl="🌍 SSH (NL)" if ssh_ok else "⚠️ SSH не задан"
     return _kbd([
-        [{"l":"🗑 Удалить все видео","c":"negative"}],
-        [{"l":"« Назад"}]])
-    a=svc_active(TG_SVC)
-    return _kbd([
-        [{"l":"🟢 TG активен" if a else "🔴 TG неактивен","c":"positive" if a else "negative"}],
-        [{"l":"▶️ Включить TG бота","c":"positive"},{"l":"⏹ Выключить TG бота","c":"negative"}],
+        [{"l":"🔍 Поиск видео","c":"primary"},{"l":"▶️ Последние видео канала"}],
+        [{"l":"📺 Мои подписки","c":"primary"},{"l":"➕ Подписаться на канал","c":"positive"}],
+        [{"l":"➖ Отписаться от канала","c":"negative"}],
         [{"l":"« Назад"}]])
 
 def kbd_hist():
@@ -1756,9 +1948,23 @@ def kbd_hist():
         [{"l":"🗑️ Очистить историю","c":"negative"}],
         [{"l":"« Назад"}]])
 
-def kbd_settings():
+def kbd_settings(uid=None):
     lbl="🔒 Скрыть инструменты" if not get_sensitive() else "🔓 Показать инструменты"
-    return _kbd([[{"l":lbl}],[{"l":"🗑️ Удалить бота с сервера","c":"negative"}],[{"l":"« Назад"}]])
+    rows=[[{"l":lbl}]]
+    if uid and is_admin(uid):
+        rows.append([{"l":"👮 Администрирование","c":"primary"}])
+    rows+=[
+        [{"l":"🗑️ Удалить бота с сервера","c":"negative"}],
+        [{"l":"« Назад"}]]
+    return _kbd(rows)
+
+def kbd_admin():
+    return _kbd([
+        [{"l":"➕ Добавить пользователя","c":"positive"},{"l":"➖ Удалить пользователя","c":"negative"}],
+        [{"l":"📋 Список пользователей","c":"primary"}],
+        [{"l":"🔧 Функции пользователей","c":"primary"}],
+        [{"l":"📢 Рассылка","c":"primary"}],
+        [{"l":"« Назад"}]])
 
 def kbd_console():
     return _kbd([[{"l":"« Назад"}]])
@@ -1782,8 +1988,17 @@ def kbd_xui():
         [{"l":"⏹ Ядро-стоп","c":"negative"},{"l":"🔌 Ядро-порт"},{"l":"🔃 Ядро-сброс","c":"negative"}],
         [{"l":"« Назад"}]])
 
+def kbd_tg():
+    a=svc_active(TG_SVC)
+    return _kbd([
+        [{"l":"🟢 TG активен" if a else "🔴 TG неактивен","c":"positive" if a else "negative"}],
+        [{"l":"▶️ Включить TG бота","c":"positive"},{"l":"⏹ Выключить TG бота","c":"negative"}],
+        [{"l":"« Назад"}]])
+
 # ── Отправка сообщений ────────────────────────────────────────
 def send(vk,uid,text,kbd=None):
+    # VK ограничение: 4096 символов
+    if len(text)>4096: text=text[:4090]+"…"
     p={"user_id":uid,"message":text,"random_id":random.randint(0,2**31)}
     if kbd: p["keyboard"]=kbd
     vk.messages.send(**p)
@@ -1793,262 +2008,617 @@ def send_attach(vk,uid,text,attachment,kbd=None):
     if kbd: p["keyboard"]=kbd
     vk.messages.send(**p)
 
-# ── Основной обработчик ───────────────────────────────────────
+# ── Яндекс.Диск ──────────────────────────────────────────────
 YA_API="https://cloud-api.yandex.net/v1/disk/resources"
 YA_FOLDER="/yt_bot_videos"
 
 def yadisk_cleanup(token,max_age_days=7,min_free_pct=10):
-    """Удаляет файлы старше max_age_days и при нехватке места — самые старые."""
     import requests as req
     from datetime import datetime,timezone
-    h={"Authorization":f"OAuth {token}"}
-    deleted=0
+    h={"Authorization":f"OAuth {token}"}; deleted=0
     try:
-        # Проверяем квоту
         low_space=False
         try:
             ri=req.get("https://cloud-api.yandex.net/v1/disk",headers=h,timeout=30)
-            di=ri.json()
-            total=di.get("total_space",1); used=di.get("used_space",0)
+            di=ri.json(); total=di.get("total_space",1); used=di.get("used_space",0)
             low_space=(1-used/total)*100 < min_free_pct
-        except Exception: pass
-
-        # Получаем список файлов в папке
+        except: pass
         r=req.get(f"{YA_API}",headers=h,timeout=30,
                   params={"path":YA_FOLDER,"fields":"_embedded.items","limit":"100"})
         if r.status_code!=200: return 0
         items=r.json().get("_embedded",{}).get("items",[])
         now=datetime.now(timezone.utc)
-
-        # Сортируем по дате — самые старые первые
         def get_created(x):
             try: return datetime.fromisoformat(x.get("created","").replace("Z","+00:00"))
             except: return now
-        items_sorted=sorted(items,key=get_created)
-
-        for item in items_sorted:
+        for item in sorted(items,key=get_created):
             try:
-                created=get_created(item)
-                age_days=(now-created).days
+                age_days=(now-get_created(item)).days
                 if age_days>=max_age_days or low_space:
                     req.delete(f"{YA_API}",headers=h,timeout=30,
                                params={"path":item["path"],"permanently":"true"})
                     deleted+=1
-                    logger.info(f"YaDisk cleanup: {item['name']} ({age_days}д)")
-                    # Перепроверяем место после удаления
                     if low_space:
-                        ri2=req.get("https://cloud-api.yandex.net/v1/disk",
-                                    headers=h,timeout=30)
-                        di2=ri2.json()
-                        t2=di2.get("total_space",1); u2=di2.get("used_space",0)
+                        ri2=req.get("https://cloud-api.yandex.net/v1/disk",headers=h,timeout=30)
+                        di2=ri2.json(); t2=di2.get("total_space",1); u2=di2.get("used_space",0)
                         if (1-u2/t2)*100>=min_free_pct: low_space=False
-            except Exception as e:
-                logger.warning(f"YaDisk cleanup item error: {e}")
+            except: pass
     except Exception as e:
         logger.error(f"YaDisk cleanup error: {e}")
     return deleted
 
+
+def _get_vm_external_ip():
+    """Получает внешний IP Яндекс.Облако ВМ через yc CLI."""
+    try:
+        import json as _json
+        r=subprocess.run(
+            ["yc","compute","instance","get",cfg["vm_id"],"--format","json"],
+            capture_output=True,text=True,timeout=30,
+            env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin:/root/yandex-cloud/bin"})
+        if r.returncode!=0: return None
+        d=_json.loads(r.stdout)
+        for iface in d.get("network_interfaces",[]):
+            nat=iface.get("primary_v4_address",{}).get("one_to_one_nat",{})
+            if nat.get("address"): return nat["address"]
+    except Exception as e:
+        logger.warning(f"_get_vm_external_ip: {e}")
+    return None
+
+def yadisk_upload_via_ssh(token,local_path,filename):
+    """Загружает файл на Яндекс.Диск через SSH на российскую ВМ.
+    Флоу: SCP → vm:/tmp/ytdl/ → curl Yandex.Disk API → rm → return public_url
+    """
+    ssh_user=cfg.get("yadisk_ssh_user","ubuntu")
+    ssh_key=cfg.get("yadisk_ssh_key","")
+    if not ssh_key:
+        return None  # нет ключа — фолбек на прямую загрузку
+
+    vm_ip=_get_vm_external_ip()
+    if not vm_ip:
+        logger.warning("yadisk_upload_via_ssh: не удалось получить IP ВМ")
+        return None
+
+    remote_dir="/tmp/ytdl_yadisk"
+    remote_file=f"{remote_dir}/{filename}"
+    ya_folder="/yt_bot_videos"
+    ya_path=f"{ya_folder}/{filename}"
+
+    ssh_opts=["-o","StrictHostKeyChecking=no","-o","ConnectTimeout=15",
+              "-o","BatchMode=yes","-i",ssh_key]
+    ssh_base=["ssh"]+ssh_opts+[f"{ssh_user}@{vm_ip}"]
+    scp_opts=["-o","StrictHostKeyChecking=no","-i",ssh_key]
+
+    try:
+        # Создаём tmp папку на ВМ
+        subprocess.run(ssh_base+[f"mkdir -p {remote_dir}"],timeout=15,capture_output=True)
+
+        # SCP файл на ВМ
+        r=subprocess.run(
+            ["scp"]+scp_opts+[local_path,f"{ssh_user}@{vm_ip}:{remote_file}"],
+            capture_output=True,text=True,timeout=600)
+        if r.returncode!=0:
+            logger.warning(f"SCP failed: {r.stderr}")
+            return None
+
+        # Создаём папку на Яндекс.Диске (игнорируем ошибку если есть)
+        subprocess.run(ssh_base+[
+            f"curl -s -X PUT 'https://cloud-api.yandex.net/v1/disk/resources"
+            f"?path={ya_folder}' -H 'Authorization: OAuth {token}'"],
+            timeout=30,capture_output=True)
+
+        # Получаем URL для загрузки
+        r2=subprocess.run(ssh_base+[
+            f"curl -s 'https://cloud-api.yandex.net/v1/disk/resources/upload"
+            f"?path={ya_path}&overwrite=true' -H 'Authorization: OAuth {token}'"],
+            capture_output=True,text=True,timeout=30)
+        import json as _j
+        upload_url=_j.loads(r2.stdout).get("href","")
+        if not upload_url:
+            logger.warning(f"yadisk_upload_via_ssh: нет upload URL: {r2.stdout[:200]}")
+            subprocess.run(ssh_base+[f"rm -f {remote_file}"],timeout=15,capture_output=True)
+            return None
+
+        # Загружаем на Яндекс.Диск с ВМ
+        r3=subprocess.run(ssh_base+[
+            f"curl -s -T '{remote_file}' '{upload_url}'"],
+            capture_output=True,text=True,timeout=900)
+        if r3.returncode!=0:
+            logger.warning(f"yadisk curl upload failed: {r3.stderr}")
+            subprocess.run(ssh_base+[f"rm -f {remote_file}"],timeout=15,capture_output=True)
+            return None
+
+        # Публикуем
+        subprocess.run(ssh_base+[
+            f"curl -s -X PUT 'https://cloud-api.yandex.net/v1/disk/resources/publish"
+            f"?path={ya_path}' -H 'Authorization: OAuth {token}'"],
+            timeout=30,capture_output=True)
+
+        # Получаем публичную ссылку
+        r4=subprocess.run(ssh_base+[
+            f"curl -s 'https://cloud-api.yandex.net/v1/disk/resources"
+            f"?path={ya_path}' -H 'Authorization: OAuth {token}'"],
+            capture_output=True,text=True,timeout=30)
+        pub_url=_j.loads(r4.stdout).get("public_url","")
+
+        # Чистим временный файл с ВМ
+        subprocess.run(ssh_base+[f"rm -f {remote_file}"],timeout=15,capture_output=True)
+
+        logger.info(f"yadisk_upload_via_ssh: {filename} → {pub_url}")
+        return pub_url or None
+
+    except Exception as e:
+        logger.error(f"yadisk_upload_via_ssh: {e}")
+        try: subprocess.run(ssh_base+[f"rm -f {remote_file}"],timeout=10,capture_output=True)
+        except: pass
+        return None
+
 def yadisk_upload(token,local_path,filename):
-    """Загружает файл на Яндекс.Диск, делает публичным, возвращает ссылку."""
     import requests as req
-    h={"Authorization":f"OAuth {token}"}
-    remote=f"{YA_FOLDER}/{filename}"
-
-    # Создаём папку если нет
+    h={"Authorization":f"OAuth {token}"}; remote=f"{YA_FOLDER}/{filename}"
     req.put(YA_API,headers=h,params={"path":YA_FOLDER})
-
-    # Получаем URL для загрузки
-    r=req.get(f"{YA_API}/upload",headers=h,
-              params={"path":remote,"overwrite":"true"},timeout=30)
+    r=req.get(f"{YA_API}/upload",headers=h,params={"path":remote,"overwrite":"true"},timeout=30)
     r.raise_for_status()
     upload_url=r.json()["href"]
-
-    # Загружаем файл потоком (не читаем в RAM)
     with open(local_path,"rb") as f:
         r=req.put(upload_url,data=f,timeout=600)
     r.raise_for_status()
-
-    # Публикуем
     req.put(f"{YA_API}/publish",headers=h,params={"path":remote},timeout=30)
-
-    # Получаем публичную ссылку
     r=req.get(YA_API,headers=h,params={"path":remote},timeout=30)
     r.raise_for_status()
     return r.json().get("public_url","")
 
+def sponsorblock_check(video_id):
+    import requests as req
+    try:
+        r=req.get("https://sponsor.ajay.app/api/skipSegments",
+            params={"videoID":video_id,"categories":["sponsor","selfpromo","interaction","intro","outro"]},
+            timeout=10)
+        if r.status_code==200: return r.json()
+        return []
+    except: return []
+
+def sponsorblock_cut(vpath,segments,out_path):
+    if not segments: return vpath
+    try:
+        conditions="+".join([f"between(t,{s['segment'][0]},{s['segment'][1]})" for s in segments])
+        filter_str=f"select='not({conditions})',setpts=N/FRAME_RATE/TB"
+        afilter=f"aselect='not({conditions})',asetpts=N/SR/TB"
+        r=subprocess.run([
+            "ffmpeg","-y","-i",vpath,
+            "-vf",filter_str,"-af",afilter,
+            "-c:v","libx264","-c:a","aac","-threads","1",
+            out_path],capture_output=True,timeout=300)
+        if r.returncode==0: return out_path
+    except Exception as e:
+        logger.warning(f"SponsorBlock cut error: {e}")
+    return vpath
+
 def _yt_download_and_send(vk,uid,url,title,fmt,st):
-    """Скачивает YouTube видео с ограничением CPU, отправляет через Яндекс.Диск или как документ."""
-    ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
+    """Скачивает YouTube видео через SSH (NL VPS) или локально, отправляет."""
+    safe_title=re.sub(r'[\\/*?:"<>|]','',title)[:60].strip() or "video"
+    send(vk,uid,f"⏳ Скачиваю «{safe_title}»...")
 
-    send(vk,uid,f"⏳ Скачиваю «{title}»...")
+    use_ssh=bool(cfg.get("ssh_host",""))
     with tempfile.TemporaryDirectory() as tmp:
-        out=f"{tmp}/video.%(ext)s"
         try:
-            # cpulimit -i — рекурсивно ограничивает все дочерние процессы (ffmpeg тоже)
-            r=subprocess.run(
-                [ytdlp,"-f",fmt,
-                 "--merge-output-format","mp4",
-                 "--postprocessor-args","ffmpeg:-c:v copy -c:a aac -threads 1",
-                 "--no-playlist","--socket-timeout","30",
-                 "-o",out,"--no-part",url],
-                capture_output=True,text=True,timeout=600,
-                preexec_fn=lambda: os.nice(19),
-                env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
-            if r.returncode!=0:
-                send(vk,uid,f"❌ Ошибка:\n{(r.stderr or r.stdout)[-400:]}"); return
-            files=glob.glob(f"{tmp}/video.*") or glob.glob(f"{tmp}/*.mp4")
-            if not files: send(vk,uid,"❌ Файл не найден"); return
-            vpath=files[0]
+            vpath=None
+            if use_ssh:
+                send(vk,uid,"🌍 Загружаю через NL VPS (обход блокировок)...")
+                vpath,err=_yt_download_via_ssh(url,fmt,tmp)
+                if vpath is None:
+                    send(vk,uid,f"⚠️ SSH-загрузка не удалась: {err}\n⬇️ Пробую локально...")
+                    use_ssh=False
 
-            # ffprobe: проверяем наличие видео и аудио
+            if not use_ssh:
+                ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
+                out=f"{tmp}/{safe_title}.%(ext)s"
+                r=subprocess.run(
+                    [ytdlp,"-f",fmt,
+                     "--merge-output-format","mp4",
+                     "--postprocessor-args","ffmpeg:-c:v libx264 -preset ultrafast -crf 23 -c:a aac -threads 1",
+                     "--no-playlist","--socket-timeout","30","--restrict-filenames",
+                     "-o",out,"--no-part",url],
+                    capture_output=True,text=True,timeout=600,
+                    preexec_fn=lambda: os.nice(19),
+                    env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
+                if r.returncode!=0:
+                    send(vk,uid,f"❌ Ошибка:\n{(r.stderr or r.stdout)[-400:]}"); return
+                files=glob.glob(f"{tmp}/*.mp4") or glob.glob(f"{tmp}/*.*")
+                if not files: send(vk,uid,"❌ Файл не найден после скачивания"); return
+                vpath=files[0]
+
+            if not vpath or not os.path.exists(vpath):
+                send(vk,uid,"❌ Файл не найден"); return
+
+            # ffprobe: проверяем потоки
             probe=subprocess.run(
                 ["ffprobe","-v","error","-show_entries","stream=codec_type",
-                 "-of","csv=p=0",vpath],
-                capture_output=True,text=True)
+                 "-of","csv=p=0",vpath],capture_output=True,text=True)
             streams=probe.stdout.strip().split("\n") if probe.returncode==0 else []
             if "audio" not in streams and fmt!="bestvideo+bestaudio/best":
                 send(vk,uid,"⚠️ Аудио не найдено в дубляже, скачиваю оригинал...")
                 _yt_download_and_send(vk,uid,url,title,"bestvideo+bestaudio/best",st)
                 return
             if "video" not in streams:
-                send(vk,uid,"❌ Видео не найдено в файле"); return
+                send(vk,uid,"❌ Видео-поток не найден в файле"); return
+
+            # SponsorBlock
+            vid_m=re.search(r'(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})',url)
+            if vid_m:
+                segments=sponsorblock_check(vid_m.group(1))
+                if segments:
+                    times=", ".join([f"{int(s['segment'][0]//60)}:{int(s['segment'][0]%60):02d}–"
+                                     f"{int(s['segment'][1]//60)}:{int(s['segment'][1]%60):02d}"
+                                     for s in segments[:5]])
+                    send(vk,uid,f"⚠️ SponsorBlock: {len(segments)} реклам/спонсоров ({times})\n✂️ Вырезаю...")
+                    cut_path=os.path.join(tmp,f"{safe_title}_clean.mp4")
+                    vpath=sponsorblock_cut(vpath,segments,cut_path)
+                    sz=os.path.getsize(vpath)/(1024*1024)
+                    send(vk,uid,f"✅ Реклама вырезана, размер: {sz:.1f} MB")
 
             sz=os.path.getsize(vpath)/(1024*1024)
             send(vk,uid,f"⬆️ Отправляю ({sz:.1f} MB)...")
 
             yadisk_token=cfg.get("yadisk_token","")
-            use_yadisk=yadisk_token and sz>200  # Яндекс.Диск для файлов > 200 MB
+            fname=f"{safe_title}.mp4"
 
             if sz>200 and not yadisk_token:
                 send(vk,uid,
-                    f"❌ Файл {sz:.0f} MB — VK API не принимает больше 200 MB.\n"
-                    f"Добавь Yandex OAuth Token через пункт 7 меню для загрузки больших файлов.")
+                    f"❌ Файл {sz:.0f} MB — VK API не принимает >200 MB.\n"
+                    f"Добавь Yandex OAuth Token через пункт 7 меню установщика.")
                 return
 
-            if use_yadisk:
-                # Чистим диск перед загрузкой если мало места
+            if yadisk_token and sz>200:
                 try: yadisk_cleanup(yadisk_token,max_age_days=7,min_free_pct=15)
                 except Exception as e: logger.warning(f"pre-upload cleanup: {e}")
-                fname=f"{int(time.time())}_{os.path.basename(vpath)}"
-                pub_url=yadisk_upload(yadisk_token,vpath,fname)
+
+                # Пробуем загрузку через SSH на Яндекс Cloud ВМ (быстрее внутри РФ)
+                pub_url=None
+                if cfg.get("yadisk_ssh_key",""):
+                    send(vk,uid,"☁️ Загружаю на Яндекс.Диск через ВМ (быстрый канал)...")
+                    pub_url=yadisk_upload_via_ssh(yadisk_token,vpath,fname)
+                    if not pub_url:
+                        send(vk,uid,"⚠️ SSH-загрузка не удалась, пробую напрямую...")
+
+                # Фолбек: прямая загрузка с NL VPS
+                if not pub_url:
+                    send(vk,uid,"⬆️ Загружаю напрямую на Яндекс.Диск...")
+                    pub_url=yadisk_upload(yadisk_token,vpath,fname)
+
                 if pub_url:
-                    cur_kbd={"main":kbd_main,"tools":kbd_tools}.get(st,kbd_main)()
-                    send(vk,uid,f"📹 {title} ({sz:.1f} MB)\n🔗 Скачать: {pub_url}",cur_kbd)
+                    cur_kbd={"main":kbd_main,"tools":kbd_tools,"youtube":kbd_youtube}.get(st,kbd_main)()
+                    send(vk,uid,f"📹 {safe_title} ({sz:.1f} MB)\n🔗 Скачать: {pub_url}",cur_kbd)
                     db.log_command("vk",uid,f"yt {url[:80]}",f"yadisk {sz:.1f}MB",True)
                     return
-                # Если Яндекс.Диск не сработал — падаем в document upload
                 send(vk,uid,"⚠️ Яндекс.Диск недоступен, пробую через VK...")
 
-            # Прямая загрузка в VK (до 4 GB, таймаут 10 минут)
-            att=vk_upload_doc(uid,vpath,os.path.basename(vpath),"YouTube видео")
-            cur_kbd={"main":kbd_main,"tools":kbd_tools}.get(st,kbd_main)()
-            send_attach(vk,uid,f"📹 {title} ({sz:.1f} MB)",att,cur_kbd)
+            att=vk_upload_doc(uid,vpath,fname,f"YouTube: {safe_title}")
+            cur_kbd={"main":kbd_main,"tools":kbd_tools,"youtube":kbd_youtube}.get(st,kbd_main)()
+            send_attach(vk,uid,f"📹 {safe_title} ({sz:.1f} MB)",att,cur_kbd)
             db.log_command("vk",uid,f"yt {url[:80]}",f"{sz:.1f}MB",True)
         except subprocess.TimeoutExpired:
-            send(vk,uid,"⏱ Таймаут. Видео слишком длинное.")
+            send(vk,uid,"⏱ Таймаут. Видео слишком длинное или сервер перегружен.")
         except Exception as e:
             send(vk,uid,f"❌ {e}")
 
+def _yt_get_meta(url):
+    """Возвращает (title, dubbed_list) для URL."""
+    title="YouTube"; dubbed=[]
+    try:
+        import yt_dlp as yt_dlp_lib
+        with yt_dlp_lib.YoutubeDL({"quiet":True,"no_warnings":True,"noplaylist":True}) as ydl:
+            info=ydl.extract_info(url,download=False)
+        title=info.get("title","YouTube")[:60]
+        for f in (info.get("formats") or []):
+            note=(f.get("format_note") or "").lower()
+            lang=f.get("language") or ""
+            if f.get("acodec")!="none" and f.get("vcodec")=="none":
+                if "dubbed" in note or "дубляж" in note or (lang and lang not in ("en","und","")):
+                    dubbed.append({"lang":lang,"label":f"{lang.upper()} дубляж" if lang else note,"fid":f["format_id"]})
+    except Exception as e:
+        logger.warning(f"yt metadata: {e}")
+    return title,dubbed
+
 def handle(vk,uid,text):
-    if uid not in cfg["allowed_users"]: send(vk,uid,"⛔ Нет доступа"); return
+    if uid not in get_all_users(): send(vk,uid,"⛔ Нет доступа"); return
     st=states.get(uid,"main"); text=text.strip()
 
     # ── YouTube: автодетект ссылок в любом состоянии ────────────
     if re.search(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+',text):
         send(vk,uid,"🔍 Получаю информацию о видео...")
-        ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
-
-        # Получаем метаданные для дубляжей
-        title="YouTube"; dubbed=[]
-        try:
-            import yt_dlp as yt_dlp_lib
-            with yt_dlp_lib.YoutubeDL({"quiet":True,"no_warnings":True,"noplaylist":True}) as ydl:
-                info=ydl.extract_info(text,download=False)
-            title=info.get("title","YouTube")[:60]
-            for f in (info.get("formats") or []):
-                note=(f.get("format_note") or "").lower()
-                lang=f.get("language") or ""
-                if f.get("acodec")!="none" and f.get("vcodec")=="none":
-                    if "dubbed" in note or "дубляж" in note or (lang and lang not in ("en","und","")):
-                        dubbed.append({"lang":lang,"label":f"{lang.upper()} дубляж" if lang else note,"fid":f["format_id"]})
-        except Exception as e:
-            logger.warning(f"yt metadata: {e}")
-
+        title,dubbed=_yt_get_meta(text)
         if dubbed:
             dub_list="\n".join([f"{i+1}. {d['label']}" for i,d in enumerate(dubbed)])
             send(vk,uid,
-                f"🎬 {title}\n\n"
-                f"Доступны дубляжи:\n{dub_list}\n{len(dubbed)+1}. Оригинал\n\n"
+                f"🎬 {title}\n\nДоступны дубляжи:\n{dub_list}\n{len(dubbed)+1}. Оригинал\n\n"
                 f"Качество:\nA) 720p  B) 480p  C) 360p\n\n"
-                f"Ответь, например: 1A (RU дубляж 720p) или {len(dubbed)+1}C (оригинал 360p)\n"
-                f"Или просто номер — будет 720p по умолчанию:")
+                f"Ответь, например: 1A (RU 720p) или {len(dubbed)+1}C (оригинал 360p)")
             states[uid]="yt_dub_choice"
-            pending[uid]={"url":text,"dubbed":dubbed,"title":title}
-            return
-
-        # Нет дубляжей — спрашиваем только качество
-        send(vk,uid,
-            f"🎬 {title}\n\nВыбери качество:\n"
-            f"A) 720p\nB) 480p\nC) 360p\n\nОтветь буквой (или Enter — 720p):")
-        states[uid]="yt_quality_choice"
-        pending[uid]={"url":text,"title":title,"fmt_base":"bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best"}
+            pending[uid]={"url":text,"dubbed":dubbed,"title":title,"prev_st":st}
+        else:
+            send(vk,uid,f"🎬 {title}\n\nВыбери качество:\nA) 720p\nB) 480p\nC) 360p")
+            states[uid]="yt_quality_choice"
+            pending[uid]={"url":text,"title":title,"prev_st":st}
         return
 
-    elif st=="yt_dub_choice":
-        import re as _re
-        # Если ввод не число[+буква] — это кнопка меню, отменяем и переотправляем
-        if not _re.match(r'^\d+[ABCabc]?$',text.strip()):
-            pending.pop(uid,None); states[uid]="main"
+    # ── Состояние: выбор дубляжа ─────────────────────────────────
+    if st=="yt_dub_choice":
+        if not re.match(r'^\d+[ABCabc]?$',text.strip()):
+            pending.pop(uid,None); states[uid]=pending.get(uid,{}).get("prev_st","main")
             handle(vk,uid,text); return
-
         data=pending.pop(uid,{})
         url=data.get("url",""); dubbed=data.get("dubbed",[]); title=data.get("title","YouTube")
-        if not url: send(vk,uid,"❌ Сессия истекла, отправь ссылку заново",kbd_main()); states[uid]="main"; return
-
-        m=_re.match(r'^(\d+)([ABCabc]?)$',text.strip())
+        if not url: send(vk,uid,"❌ Сессия истекла",kbd_main()); states[uid]="main"; return
+        m=re.match(r'^(\d+)([ABCabc]?)$',text.strip())
         choice=int(m.group(1))-1; quality=(m.group(2).upper() or "A")
         height={"A":"720","B":"480","C":"360"}.get(quality,"720")
-
         if choice==len(dubbed):
-            fmt=f"bestvideo[vcodec^=avc1][height<={height}]+bestaudio/bestvideo[height<={height}]+bestaudio/best"
+            fmt=f"bestvideo[height<={height}]+bestaudio/bestvideo+bestaudio/best"
         elif 0<=choice<len(dubbed):
             fid=dubbed[choice]['fid']
-            fmt=f"bestvideo[vcodec^=avc1][height<={height}]+{fid}/bestvideo[height<={height}]+{fid}/bestvideo+bestaudio/best"
+            fmt=f"bestvideo[height<={height}]+{fid}/bestvideo[height<={height}]+bestaudio/best"
         else:
             pending[uid]=data; send(vk,uid,"❌ Неверный номер"); return
-
+        prev_st=data.get("prev_st","main")
         states[uid]="main"
-        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height}p)...\nБот остаётся доступен пока идёт загрузка.")
-        threading.Thread(target=_yt_download_and_send,
-            args=(vk,uid,url,title,fmt,"main"),daemon=True).start()
+        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height}p)...\nБот остаётся доступен.")
+        threading.Thread(target=_yt_download_and_send,args=(vk,uid,url,title,fmt,prev_st),daemon=True).start()
         return
 
-    elif st=="yt_quality_choice":
-        import re as _re
-        if not _re.match(r'^[ABCabc]$',text.strip()):
-            pending.pop(uid,None); states[uid]="main"
+    # ── Состояние: выбор качества ────────────────────────────────
+    if st=="yt_quality_choice":
+        if not re.match(r'^[ABCabc]$',text.strip()):
+            pending.pop(uid,None); states[uid]=pending.get(uid,{}).get("prev_st","main")
             handle(vk,uid,text); return
-
         data=pending.pop(uid,{})
         url=data.get("url",""); title=data.get("title","YouTube")
         if not url: send(vk,uid,"❌ Сессия истекла",kbd_main()); states[uid]="main"; return
-
-        quality=text.strip().upper()
-        height={"A":"720","B":"480","C":"360"}.get(quality,"720")
-        fmt=f"bestvideo[vcodec^=avc1][height<={height}]+bestaudio/bestvideo[height<={height}]+bestaudio/best"
-
+        height={"A":"720","B":"480","C":"360"}.get(text.strip().upper(),"720")
+        fmt=f"bestvideo[height<={height}]+bestaudio/bestvideo[height<={height}]+bestaudio/best"
+        prev_st=data.get("prev_st","main")
         states[uid]="main"
-        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height}p)...\nБот остаётся доступен пока идёт загрузка.")
-        threading.Thread(target=_yt_download_and_send,
-            args=(vk,uid,url,title,fmt,"main"),daemon=True).start()
+        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height}p)...\nБот остаётся доступен.")
+        threading.Thread(target=_yt_download_and_send,args=(vk,uid,url,title,fmt,prev_st),daemon=True).start()
+        return
+
+    # ── Состояния YouTube-поиска ──────────────────────────────────
+    if st=="yt_search_input":
+        if text=="« Назад":
+            states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube()); return
+        send(vk,uid,"🔍 Ищу...")
+        results=yt_search(text,5)
+        if not results:
+            send(vk,uid,"❌ Ничего не найдено",kbd_youtube()); states[uid]="youtube"; return
+        lines=[f"🔍 Результаты поиска «{text[:40]}»:\n"]
+        for i,r in enumerate(results,1):
+            lines.append(f"{i}. {r['title']}\n   ▶️ {r['channel']}\n   {r['url']}")
+        send(vk,uid,"\n\n".join(lines)+"\n\nВведи номер для скачивания или « Назад:")
+        states[uid]="yt_search_results"
+        pending[uid]={"results":results,"query":text}
+        return
+
+    if st=="yt_search_results":
+        if text=="« Назад":
+            states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube()); return
+        try:
+            n=int(text.strip())-1
+            data=pending.pop(uid,{}); results=data.get("results",[])
+            if not 0<=n<len(results):
+                send(vk,uid,"❌ Неверный номер (1-5)"); return
+            v=results[n]; url=v["url"]; title=v["title"]
+            send(vk,uid,f"🎬 {title}\n\nВыбери качество:\nA) 720p\nB) 480p\nC) 360p")
+            states[uid]="yt_quality_choice"
+            pending[uid]={"url":url,"title":title,"prev_st":"youtube"}
+        except:
+            send(vk,uid,"❌ Введи число от 1 до 5")
+        return
+
+    # ── Состояния YouTube-канала (последние видео) ────────────────
+    if st=="yt_channel_latest_input":
+        if text=="« Назад":
+            states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube()); return
+        send(vk,uid,"⏳ Получаю последние видео...")
+        cid,cname,videos=yt_get_channel_info(text)
+        if not videos:
+            send(vk,uid,"❌ Не удалось получить видео с канала",kbd_youtube())
+            states[uid]="youtube"; return
+        lines=[f"📺 Последние видео канала {cname or text}:\n"]
+        for i,v in enumerate(videos,1):
+            lines.append(f"{i}. {v['title']}\n   {v['url']}")
+        send(vk,uid,"\n\n".join(lines)+"\n\nВведи номер для скачивания:")
+        states[uid]="yt_channel_latest_pick"
+        pending[uid]={"videos":videos,"cname":cname}
+        return
+
+    if st=="yt_channel_latest_pick":
+        if text=="« Назад":
+            states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube()); return
+        try:
+            n=int(text.strip())-1
+            data=pending.pop(uid,{}); videos=data.get("videos",[])
+            if not 0<=n<len(videos):
+                send(vk,uid,f"❌ Неверный номер (1-{len(videos)})"); return
+            v=videos[n]; url=v["url"]; title=v["title"]
+            send(vk,uid,f"🎬 {title}\n\nВыбери качество:\nA) 720p\nB) 480p\nC) 360p")
+            states[uid]="yt_quality_choice"
+            pending[uid]={"url":url,"title":title,"prev_st":"youtube"}
+        except:
+            send(vk,uid,"❌ Введи число")
+        return
+
+    # ── Состояния подписки на канал ───────────────────────────────
+    if st=="yt_subscribe_input":
+        if text=="« Назад":
+            states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube()); return
+        send(vk,uid,"⏳ Получаю информацию о канале...")
+        cid,cname,videos=yt_get_channel_info(text)
+        if not cid:
+            send(vk,uid,"❌ Не удалось найти канал",kbd_youtube())
+            states[uid]="youtube"; return
+        data=load_yt_subs()
+        if cid not in data["channels"]:
+            data["channels"][cid]={"name":cname,"url":text,"subscribers":[],"last_video_id":videos[0]["id"] if videos else "","last_check":""}
+        ch=data["channels"][cid]
+        if uid not in ch["subscribers"]:
+            ch["subscribers"].append(uid)
+            save_yt_subs(data)
+            send(vk,uid,f"✅ Подписался на канал «{cname}»!\n\nПоследнее видео: {videos[0]['title'] if videos else 'нет'}",kbd_youtube())
+        else:
+            send(vk,uid,f"ℹ️ Ты уже подписан на «{cname}»",kbd_youtube())
+        states[uid]="youtube"
+        return
+
+    if st=="yt_unsubscribe_input":
+        if text=="« Назад":
+            states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube()); return
+        data=load_yt_subs()
+        # поиск по номеру из списка
+        my_subs=[(cid,ch) for cid,ch in data["channels"].items() if uid in ch.get("subscribers",[])]
+        try:
+            n=int(text.strip())-1
+            if not 0<=n<len(my_subs):
+                send(vk,uid,"❌ Неверный номер"); return
+            cid,ch=my_subs[n]
+            ch["subscribers"].remove(uid)
+            if not ch["subscribers"]: del data["channels"][cid]  # никто не подписан — удаляем
+            save_yt_subs(data)
+            send(vk,uid,f"✅ Отписался от «{ch.get('name',cid)}»",kbd_youtube())
+        except:
+            send(vk,uid,"❌ Введи номер из списка")
+        states[uid]="youtube"
+        return
+
+    # ── Состояния администрирования ───────────────────────────────
+    if st=="admin_add_user":
+        if text=="« Назад":
+            states[uid]="admin_menu"; send(vk,uid,"👮 Администрирование:",kbd_admin()); return
+        if not is_admin(uid): send(vk,uid,"⛔ Только для администратора"); states[uid]="main"; return
+        send(vk,uid,"⏳ Ищу пользователя...")
+        vk_api_obj=vk_session_global.get_api() if vk_session_global else vk
+        new_uid,name=resolve_vk_user(vk_api_obj,text)
+        if new_uid is None:
+            send(vk,uid,f"❌ Не удалось найти пользователя: {text}"); return
+        data=load_admin()
+        if new_uid in get_all_users():
+            send(vk,uid,f"ℹ️ {name} (ID {new_uid}) уже в списке разрешённых",kbd_admin())
+            states[uid]="admin_menu"; return
+        pending[uid]={"new_uid":new_uid,"name":name}
+        send(vk,uid,f"Добавить «{name}» (ID {new_uid})?\n\nВведи PIN для подтверждения:")
+        states[uid]="admin_add_pin"
+        return
+
+    if st=="admin_add_pin":
+        if not is_admin(uid): states[uid]="main"; return
+        data_p=pending.pop(uid,{})
+        new_uid=data_p.get("new_uid"); name=data_p.get("name","?")
+        if text==cfg["admin_pin"] and new_uid:
+            data=load_admin()
+            if new_uid not in data["extra_users"]:
+                data["extra_users"].append(new_uid)
+            data["user_labels"][str(new_uid)]=name
+            save_admin(data)
+            db.log_command("vk",uid,f"add_user {new_uid}",name,True)
+            send(vk,uid,f"✅ {name} (ID {new_uid}) добавлен!\nТеперь может использовать YouTube.",kbd_admin())
+        else:
+            send(vk,uid,"❌ Неверный PIN. Отменено.",kbd_admin())
+            db.log_command("vk",uid,f"add_user","неверный PIN",False)
+        states[uid]="admin_menu"
+        return
+
+    if st=="admin_remove_user":
+        if text=="« Назад":
+            states[uid]="admin_menu"; send(vk,uid,"👮 Администрирование:",kbd_admin()); return
+        if not is_admin(uid): states[uid]="main"; return
+        try:
+            rem_uid=int(text.strip())
+        except:
+            send(vk,uid,"❌ Введи числовой VK ID"); return
+        data=load_admin()
+        extra=[int(u) for u in data.get("extra_users",[])]
+        if rem_uid not in extra:
+            send(vk,uid,"❌ Пользователь не найден в вайтлисте"); return
+        name=data.get("user_labels",{}).get(str(rem_uid),str(rem_uid))
+        pending[uid]={"rem_uid":rem_uid,"name":name}
+        send(vk,uid,f"Удалить «{name}» (ID {rem_uid})? Введи PIN:")
+        states[uid]="admin_remove_pin"
+        return
+
+    if st=="admin_remove_pin":
+        if not is_admin(uid): states[uid]="main"; return
+        data_p=pending.pop(uid,{})
+        rem_uid=data_p.get("rem_uid"); name=data_p.get("name","?")
+        if text==cfg["admin_pin"] and rem_uid:
+            data=load_admin()
+            data["extra_users"]=[u for u in data["extra_users"] if int(u)!=rem_uid]
+            data["user_labels"].pop(str(rem_uid),None)
+            data["disabled_features"].pop(str(rem_uid),None)
+            save_admin(data)
+            db.log_command("vk",uid,f"remove_user {rem_uid}",name,True)
+            send(vk,uid,f"✅ {name} (ID {rem_uid}) удалён из разрешённых.",kbd_admin())
+        else:
+            send(vk,uid,"❌ Неверный PIN.",kbd_admin())
+        states[uid]="admin_menu"
+        return
+
+    if st=="admin_features":
+        if text=="« Назад":
+            states[uid]="admin_menu"; send(vk,uid,"👮 Администрирование:",kbd_admin()); return
+        if not is_admin(uid): states[uid]="main"; return
+        # Формат: "ID функция вкл/выкл" или "глобально функция вкл/выкл"
+        # Например: "123456 youtube выкл" или "глобально vm_control выкл"
+        parts=text.lower().strip().split()
+        if len(parts)!=3:
+            send(vk,uid,(
+                "Формат команды:\n"
+                "<ID> <функция> вкл/выкл\n"
+                "или: глобально <функция> вкл/выкл\n\n"
+                "Функции: youtube, vm_control, terminal, tunnel, xui, vkpanel\n\n"
+                "Примеры:\n123456 youtube выкл\nглобально vm_control выкл"))
+            return
+        target,feature,action=parts
+        if feature not in ("youtube","vm_control","terminal","tunnel","xui","vkpanel"):
+            send(vk,uid,"❌ Неизвестная функция"); return
+        data=load_admin()
+        if target=="глобально":
+            gd=data.setdefault("global_disabled",[])
+            if action in ("выкл","off","0"):
+                if feature not in gd: gd.append(feature)
+                send(vk,uid,f"✅ {feature} глобально отключена для не-администраторов",kbd_admin())
+            else:
+                if feature in gd: gd.remove(feature)
+                send(vk,uid,f"✅ {feature} глобально включена для всех",kbd_admin())
+        else:
+            try: t_uid=int(target)
+            except: send(vk,uid,"❌ Неверный ID"); return
+            ud=data.setdefault("disabled_features",{}).setdefault(str(t_uid),[])
+            if action in ("выкл","off","0"):
+                if feature not in ud: ud.append(feature)
+                send(vk,uid,f"✅ {feature} отключена для ID {t_uid}",kbd_admin())
+            else:
+                if feature in ud: ud.remove(feature)
+                send(vk,uid,f"✅ {feature} включена для ID {t_uid}",kbd_admin())
+        save_admin(data)
+        return
+
+    if st=="admin_broadcast":
+        if text=="« Назад":
+            states[uid]="admin_menu"; send(vk,uid,"👮 Администрирование:",kbd_admin()); return
+        if not is_admin(uid): states[uid]="main"; return
+        users=get_all_users(); sent=0
+        for u in users:
+            if u==uid: continue
+            try: send(vk,u,f"📢 Сообщение от администратора:\n\n{text}"); sent+=1
+            except: pass
+        send(vk,uid,f"✅ Рассылка отправлена {sent} пользователям",kbd_admin())
+        states[uid]="admin_menu"
         return
 
     if text.lower() in ("начать","start","/start","меню"):
         states[uid]="main"; send(vk,uid,"👋 Панель управления ВМ:",kbd_main()); return
 
     # ── Состояния: ввод PIN / имён ──────────────────────────────
-
-    if st=="await_pin":  # удаление бота
+    if st=="await_pin":
         if text==cfg["admin_pin"]:
             db.log_command("vk",uid,"удаление бота","выполнено",True)
             send(vk,uid,"🗑️ PIN верный. Удаление через 3 секунды...")
@@ -2056,7 +2626,7 @@ def handle(vk,uid,text):
             threading.Thread(target=_del,daemon=True).start()
         else:
             db.log_command("vk",uid,"удаление бота","неверный PIN",False)
-            states[uid]="settings"; send(vk,uid,"❌ Неверный PIN. Отменено.",kbd_settings())
+            states[uid]="settings"; send(vk,uid,"❌ Неверный PIN. Отменено.",kbd_settings(uid))
         return
 
     if st=="set_retention":
@@ -2099,17 +2669,14 @@ def handle(vk,uid,text):
             send(vk,uid,f"❌ {out}",kbd_wg())
             db.log_command("vk",uid,f"wg getuser {name}",out[:100],False)
             return
-        # Отправляем .conf как документ
         try:
             import zipfile
             conf_bytes=out.encode()
-            # conf — записываем в tmp
             with tempfile.NamedTemporaryFile(delete=False,suffix=f"_{name}.conf") as cf:
                 cf.write(conf_bytes); cpath=cf.name
             att=vk_upload_doc(uid,cpath,f"{name}.conf",f"WG {name}.conf")
             os.unlink(cpath)
             send_attach(vk,uid,f"🔑 Туннель конфиг: {name}",att,kbd_wg())
-            # Дополнительно zip
             with tempfile.NamedTemporaryFile(delete=False,suffix=".zip") as zf_tmp:
                 zpath=zf_tmp.name
             with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as zf:
@@ -2206,20 +2773,30 @@ def handle(vk,uid,text):
     # ── Навигация по меню ────────────────────────────────────────
     if st=="main":
         if text=="📊 Статус":
+            if not user_can(uid,"vm_control"):
+                send(vk,uid,"⛔ Управление ВМ доступно только администратору",kbd_main()); return
             ok,s,_=VM.status()
             e={"RUNNING":"🟢","STOPPED":"🔴","STARTING":"🟡","STOPPING":"🟡"}.get(s,"⚪") if ok else "❌"
             r=f"{e} Статус ВМ: {s}" if ok else f"❌ {s}"
             db.log_command("vk",uid,"статус",r,ok); send(vk,uid,r,kbd_main())
         elif text=="ℹ️ Информация":
+            if not user_can(uid,"vm_control"):
+                send(vk,uid,"⛔ Управление ВМ доступно только администратору",kbd_main()); return
             ok,info=VM.info(); db.log_command("vk",uid,"информация","ОК" if ok else info,ok)
             send(vk,uid,info if ok else f"❌ {info}",kbd_main())
         elif text=="▶️ Запустить":
+            if not user_can(uid,"vm_control"):
+                send(vk,uid,"⛔ Управление ВМ доступно только администратору",kbd_main()); return
             send(vk,uid,"⏳ Запуск ВМ...",kbd_main()); ok,m=VM.start()
             db.log_command("vk",uid,"запуск ВМ",m,ok); send(vk,uid,m,kbd_main())
         elif text=="⏹ Остановить":
+            if not user_can(uid,"vm_control"):
+                send(vk,uid,"⛔ Управление ВМ доступно только администратору",kbd_main()); return
             send(vk,uid,"⏳ Остановка ВМ...",kbd_main()); ok,m=VM.stop()
             db.log_command("vk",uid,"остановка ВМ",m,ok); send(vk,uid,m,kbd_main())
         elif text=="🔄 Перезапустить":
+            if not user_can(uid,"vm_control"):
+                send(vk,uid,"⛔ Управление ВМ доступно только администратору",kbd_main()); return
             send(vk,uid,"⏳ Перезапуск...",kbd_main()); ok,m=VM.restart()
             db.log_command("vk",uid,"перезапуск ВМ",m,ok); send(vk,uid,m,kbd_main())
         elif text=="🔵 TG бот":
@@ -2227,25 +2804,40 @@ def handle(vk,uid,text):
             states[uid]="tg_control"; a=svc_active(TG_SVC)
             send(vk,uid,f"🔵 Telegram бот\nСтатус: {'🟢 активен' if a else '🔴 неактивен'}",kbd_tg())
         elif text=="📋 История": states[uid]="history"; send(vk,uid,"📋 История и БД:",kbd_hist())
-        elif text=="⚙️ Настройки": states[uid]="settings"; send(vk,uid,"⚙️ Настройки:",kbd_settings())
+        elif text=="⚙️ Настройки": states[uid]="settings"; send(vk,uid,"⚙️ Настройки:",kbd_settings(uid))
         elif text=="🔧 Инструменты":
-            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools())
+            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools(uid))
+        elif text=="⏰ Расписание":
+            if not user_can(uid,"vm_control"):
+                send(vk,uid,"⛔ Расписание доступно только администратору",kbd_main()); return
+            send(vk,uid,"⏰ Расписание:",kbd_main())
         else: send(vk,uid,"❓ Используйте кнопки.",kbd_main())
 
     elif st=="tools":
         if text=="💻 Терминал":
+            if not user_can(uid,"terminal"):
+                send(vk,uid,"⛔ Терминал доступен только администратору",kbd_tools(uid)); return
             states[uid]="console"
-            send(vk,uid,"💻 Терминал\n\nВведите команду (неинтерактивную).\n"
-                        "⏱ Таймаут: 30с | ✂️ Лимит: 4000 символов\n\nИли нажмите «Назад»",kbd_console())
+            send(vk,uid,"💻 Терминал\nВведите команду. Таймаут: 30с | Лимит: 4000 символов\n\nИли «Назад»",kbd_console())
         elif text=="🔑 Туннель":
+            if not user_can(uid,"tunnel"):
+                send(vk,uid,"⛔ Туннель доступен только администратору",kbd_tools(uid)); return
             states[uid]="wg"; send(vk,uid,"🔑 Туннель:",kbd_wg())
         elif text=="📡 Медиасервер":
+            if not user_can(uid,"vkpanel"):
+                send(vk,uid,"⛔ Медиасервер доступен только администратору",kbd_tools(uid)); return
             states[uid]="vkpanel"; send(vk,uid,"📡 Медиасервер:",kbd_vkpanel())
         elif text=="⚙️ Ядро":
+            if not user_can(uid,"xui"):
+                send(vk,uid,"⛔ Ядро доступно только администратору",kbd_tools(uid)); return
             states[uid]="xui"; send(vk,uid,"⚙️ Ядро:",kbd_xui())
+        elif text=="🎬 YouTube":
+            if not user_can(uid,"youtube"):
+                send(vk,uid,"⛔ YouTube-функции вам недоступны",kbd_tools(uid)); return
+            states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube())
         elif text=="📁 YaDisk видео":
             token=cfg.get("yadisk_token","")
-            if not token: send(vk,uid,"❌ Yandex токен не задан",kbd_tools()); return
+            if not token: send(vk,uid,"❌ Yandex токен не задан",kbd_tools(uid)); return
             try:
                 import requests as req
                 from datetime import datetime,timezone
@@ -2253,10 +2845,10 @@ def handle(vk,uid,text):
                 r=req.get(YA_API,headers=h,timeout=30,
                           params={"path":YA_FOLDER,"fields":"_embedded.items","limit":"100"})
                 if r.status_code==404:
-                    send(vk,uid,"📁 Папка пуста — видео ещё не загружались",kbd_tools()); return
+                    send(vk,uid,"📁 Папка пуста — видео ещё не загружались",kbd_tools(uid)); return
                 items=r.json().get("_embedded",{}).get("items",[])
                 if not items:
-                    send(vk,uid,"📁 Нет сохранённых видео",kbd_tools()); return
+                    send(vk,uid,"📁 Нет сохранённых видео",kbd_tools(uid)); return
                 now=datetime.now(timezone.utc)
                 lines=[]; total_mb=0
                 for i,item in enumerate(sorted(items,key=lambda x:x.get("created",""),reverse=True),1):
@@ -2270,22 +2862,83 @@ def handle(vk,uid,text):
                 states[uid]="yadisk_menu"
                 send(vk,uid,msg,kbd_yadisk())
             except Exception as e:
-                send(vk,uid,f"❌ {e}",kbd_tools())
-        else: send(vk,uid,"❓",kbd_tools())
+                send(vk,uid,f"❌ {e}",kbd_tools(uid))
+        else: send(vk,uid,"❓",kbd_tools(uid))
+
+    elif st=="youtube":
+        if text=="🔍 Поиск видео":
+            states[uid]="yt_search_input"
+            send(vk,uid,"🔍 Введи поисковый запрос:")
+        elif text=="▶️ Последние видео канала":
+            states[uid]="yt_channel_latest_input"
+            send(vk,uid,"📺 Введи ссылку на YouTube канал или @username:")
+        elif text=="📺 Мои подписки":
+            data=load_yt_subs()
+            my_subs=[(cid,ch) for cid,ch in data["channels"].items() if uid in ch.get("subscribers",[])]
+            if not my_subs:
+                send(vk,uid,"📭 Ты не подписан ни на один канал\n\nИспользуй «➕ Подписаться на канал»",kbd_youtube())
+                return
+            lines=["📺 Твои подписки:\n"]
+            for i,(cid,ch) in enumerate(my_subs,1):
+                lines.append(f"{i}. {ch.get('name',cid)}")
+            send(vk,uid,"\n".join(lines)+"\n\nВведи номер для просмотра последних видео:")
+            states[uid]="yt_subs_pick"
+            pending[uid]={"subs":my_subs}
+        elif text=="➕ Подписаться на канал":
+            states[uid]="yt_subscribe_input"
+            send(vk,uid,"📺 Введи ссылку на YouTube канал или @username:")
+        elif text=="➖ Отписаться от канала":
+            data=load_yt_subs()
+            my_subs=[(cid,ch) for cid,ch in data["channels"].items() if uid in ch.get("subscribers",[])]
+            if not my_subs:
+                send(vk,uid,"📭 Ты не подписан ни на один канал",kbd_youtube()); return
+            lines=["📺 Твои подписки:\n"]
+            for i,(cid,ch) in enumerate(my_subs,1):
+                lines.append(f"{i}. {ch.get('name',cid)}")
+            send(vk,uid,"\n".join(lines)+"\n\nВведи номер для отписки:")
+            states[uid]="yt_unsubscribe_input"
+        elif text=="« Назад":
+            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools(uid))
+        else:
+            send(vk,uid,"❓",kbd_youtube())
+
+    elif st=="yt_subs_pick":
+        if text=="« Назад":
+            states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube()); return
+        data_p=pending.pop(uid,{}); my_subs=data_p.get("subs",[])
+        try:
+            n=int(text.strip())-1
+            if not 0<=n<len(my_subs):
+                send(vk,uid,f"❌ Неверный номер (1-{len(my_subs)})"); return
+            cid,ch=my_subs[n]
+            send(vk,uid,f"⏳ Получаю последние видео «{ch.get('name',cid)}»...")
+            _,_,videos=yt_get_channel_info(ch.get("url",cid))
+            if not videos:
+                send(vk,uid,"❌ Не удалось получить видео",kbd_youtube())
+                states[uid]="youtube"; return
+            lines=[f"📺 Последние видео:\n"]
+            for i,v in enumerate(videos,1):
+                lines.append(f"{i}. {v['title']}\n   {v['url']}")
+            send(vk,uid,"\n\n".join(lines)+"\n\nВведи номер для скачивания:")
+            states[uid]="yt_channel_latest_pick"
+            pending[uid]={"videos":videos}
+        except:
+            send(vk,uid,"❌ Введи число")
+        return
 
     elif st=="yadisk_menu":
         if text=="🗑 Удалить все видео":
             token=cfg.get("yadisk_token","")
-            if not token: send(vk,uid,"❌ Токен не задан",kbd_tools()); states[uid]="tools"; return
+            if not token: send(vk,uid,"❌ Токен не задан",kbd_tools(uid)); states[uid]="tools"; return
             send(vk,uid,"⏳ Удаляю все видео...")
             try:
                 n=yadisk_cleanup(token,max_age_days=0)
-                send(vk,uid,f"✅ Удалено {n} видео с Яндекс.Диска",kbd_tools())
+                send(vk,uid,f"✅ Удалено {n} видео с Яндекс.Диска",kbd_tools(uid))
             except Exception as e:
-                send(vk,uid,f"❌ {e}",kbd_tools())
+                send(vk,uid,f"❌ {e}",kbd_tools(uid))
             states[uid]="tools"
         elif text=="« Назад":
-            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools())
+            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools(uid))
 
     elif st=="tg_control":
         if text in ("🟢 TG активен","🔴 TG неактивен"):
@@ -2323,58 +2976,116 @@ def handle(vk,uid,text):
                          f"Авто-событий: {s['auto']}\nСрок: {s['retention']} дн.\n"
                          f"Старейшая: {s['oldest']}\nНовейшая: {s['newest']}"),kbd_hist())
         elif text=="🗑️ Очистить историю":
-            deleted=db.clear_all_history(); send(vk,uid,f"🗑️ Очищено: {deleted} записей",kbd_hist())
-        elif text=="« Назад": states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main())
+            n=db.clear_all_history()
+            db.log_auto_event("manual_clear",f"Ручная очистка VK: {n} записей")
+            send(vk,uid,f"✅ Удалено {n} записей",kbd_hist())
+        elif text=="« Назад":
+            states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main())
         else: send(vk,uid,"❓",kbd_hist())
 
     elif st=="settings":
         if text in ("🔒 Скрыть инструменты","🔓 Показать инструменты"):
-            val=not get_sensitive(); set_sensitive(val)
-            mode="скрыты 🔒" if val else "видны 🔓"
-            send(vk,uid,f"✅ Инструменты {mode}",kbd_settings())
-            send(vk,uid,"↩️ Меню:",kbd_main())
+            new_val=not get_sensitive(); set_sensitive(new_val)
+            send(vk,uid,f"{'🔒 Инструменты скрыты' if new_val else '🔓 Инструменты видны'}",kbd_settings(uid))
+        elif text=="👮 Администрирование":
+            if not is_admin(uid):
+                send(vk,uid,"⛔ Только для администратора",kbd_settings(uid)); return
+            states[uid]="admin_menu"; send(vk,uid,"👮 Администрирование:",kbd_admin())
         elif text=="🗑️ Удалить бота с сервера":
             states[uid]="await_pin"
-            send(vk,uid,"⚠️ Удаление бота с сервера!\nЭто удалит всё. Введите PIN:")
-        elif text=="« Назад": states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main())
-        else: send(vk,uid,"❓",kbd_settings())
+            send(vk,uid,"🔐 Введите PIN-код для удаления бота с сервера:")
+        elif text=="« Назад":
+            states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main())
+        else: send(vk,uid,"❓",kbd_settings(uid))
 
-    elif st=="wg":
+    elif st=="admin_menu":
+        if not is_admin(uid):
+            states[uid]="main"; send(vk,uid,"⛔",kbd_main()); return
+        if text=="➕ Добавить пользователя":
+            states[uid]="admin_add_user"
+            send(vk,uid,"➕ Введи VK страницу пользователя\n(URL или @username, например: https://vk.com/durov или durov):")
+        elif text=="➖ Удалить пользователя":
+            data=load_admin()
+            extra=data.get("extra_users",[])
+            labels=data.get("user_labels",{})
+            if not extra:
+                send(vk,uid,"📭 Вайтлист пуст",kbd_admin()); return
+            lines=["➖ Пользователи в вайтлисте:\n"]
+            for u in extra:
+                lines.append(f"• {labels.get(str(u),str(u))} (ID {u})")
+            lines.append("\nВведи числовой VK ID для удаления:")
+            send(vk,uid,"\n".join(lines))
+            states[uid]="admin_remove_user"
+        elif text=="📋 Список пользователей":
+            data=load_admin()
+            labels=data.get("user_labels",{}); gd=data.get("global_disabled",[])
+            lines=["📋 Все разрешённые пользователи:\n",
+                   "👑 Администраторы (из конфига):"]
+            for u in cfg["allowed_users"]:
+                lines.append(f"  • ID {u} (все права)")
+            lines.append("\n🔓 Вайтлист:")
+            extra=data.get("extra_users",[])
+            if not extra:
+                lines.append("  (пусто)")
+            for u in extra:
+                dis=data.get("disabled_features",{}).get(str(u),[])
+                tag=f" [блок: {','.join(dis)}]" if dis else ""
+                lines.append(f"  • {labels.get(str(u),str(u))} (ID {u}){tag}")
+            lines.append(f"\n🚫 Глобально отключено для не-админов: {', '.join(gd) or 'ничего'}")
+            send(vk,uid,"\n".join(lines),kbd_admin())
+        elif text=="🔧 Функции пользователей":
+            states[uid]="admin_features"
+            send(vk,uid,(
+                "🔧 Управление функциями\n\n"
+                "Формат:\n<ID> <функция> вкл/выкл\nглобально <функция> вкл/выкл\n\n"
+                "Функции: youtube, vm_control, terminal, tunnel, xui, vkpanel\n\n"
+                "Примеры:\n"
+                "123456 youtube выкл\n"
+                "глобально vm_control выкл\n\n"
+                "По умолчанию vm_control/terminal/tunnel/xui/vkpanel\nглобально выключены (только для админа)."))
+        elif text=="📢 Рассылка":
+            states[uid]="admin_broadcast"
+            send(vk,uid,"📢 Введи текст рассылки (получат все пользователи из вайтлиста):")
+        elif text=="« Назад":
+            states[uid]="settings"; send(vk,uid,"⚙️ Настройки:",kbd_settings(uid))
+        else: send(vk,uid,"❓",kbd_admin())
+
+    elif st in ("wg","wg_adduser","wg_getuser","wg_deluser"):
         if text=="👥 Пиры":
-            send(vk,uid,"⏳ Получаю список…")
             ok,out=run_cmd_vk("wv listusers")
-            send(vk,uid,f"👥 Пользователи WG:\n{out or '—'}",kbd_wg())
+            send(vk,uid,f"👥 Пиры:\n{out or '—'}",kbd_wg())
             db.log_command("vk",uid,"wg listusers",out[:100],ok)
         elif text=="➕ Новый пир":
-            states[uid]="wg_adduser_name"; send(vk,uid,"➕ Введите имя нового пользователя:")
+            states[uid]="wg_adduser_name"; send(vk,uid,"➕ Имя нового пира (без пробелов):")
         elif text=="📥 Экспорт":
-            states[uid]="wg_getuser_name"; send(vk,uid,"📥 Введите имя пользователя:")
+            states[uid]="wg_getuser_name"; send(vk,uid,"📥 Имя пира для экспорта:")
         elif text=="🗑 Удалить пир":
-            states[uid]="wg_deluser_name"; send(vk,uid,"🗑 Введите имя пользователя для удаления:")
-        elif text=="« Назад": states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main())
+            states[uid]="wg_deluser_name"; send(vk,uid,"🗑 Имя пира для удаления:")
+        elif text=="« Назад":
+            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools(uid))
         else: send(vk,uid,"❓",kbd_wg())
 
     elif st=="vkpanel":
         if text=="▶️ МС-старт":
-            send(vk,uid,"⏳ Старт МС…")
+            send(vk,uid,"⏳")
             ok,out=run_vkpanel_vk(1)
             send(vk,uid,f"{'✅' if ok else '❌'} {out or '—'}",kbd_vkpanel())
             db.log_command("vk",uid,"vkpanel start",out[:100],ok)
         elif text=="⏹ МС-стоп":
             states[uid]="vkpanel_stop_pin"; send(vk,uid,"🔐 PIN для остановки МС:")
         elif text=="🔄 МС-рестарт":
-            send(vk,uid,"⏳ Рестарт МС…")
+            send(vk,uid,"⏳")
             ok,out=run_vkpanel_vk(3)
             send(vk,uid,f"{'✅' if ok else '❌'} {out or '—'}",kbd_vkpanel())
             db.log_command("vk",uid,"vkpanel restart",out[:100],ok)
         elif text=="📊 МС-статус":
-            ok,out=run_cmd_vk("systemctl status whitelist-bypass 2>&1 | head -20 || "
-                             "pgrep -fa vk-panel 2>&1 || echo 'Сервис не найден'")
-            send(vk,uid,f"📊 Статус МС:\n{out}",kbd_vkpanel())
+            send(vk,uid,"⏳")
+            ok,out=run_vkpanel_vk(4)
+            send(vk,uid,f"📊 Статус МС:\n{out or '—'}",kbd_vkpanel())
             db.log_command("vk",uid,"vkpanel status",out[:100],ok)
         elif text=="📋 МС-логи":
             send(vk,uid,"⏳ Получаю логи…")
-            ok,out=run_vkpanel_vk(16)
+            ok,out=run_vkpanel_vk(5)
             send(vk,uid,f"📋 Логи МС:\n{out or '—'}",kbd_vkpanel())
             db.log_command("vk",uid,"vkpanel logs",out[:50],ok)
         elif text=="📱 МС-QR":
@@ -2435,9 +3146,12 @@ def main():
     if not cfg["group_id"]: print("❌ Нет ID группы VK"); return
     vk_session_global=vk_api.VkApi(token=cfg["group_token"])
     vk=vk_session_global.get_api(); longpoll=VkBotLongPoll(vk_session_global,cfg["group_id"])
-    logger.info(f"VK бот запущен v4.4. Group: {cfg['group_id']}"); print("✅ VK бот запущен!")
+    logger.info(f"VK бот запущен v5.0. Group: {cfg['group_id']}"); print("✅ VK бот v5.0 запущен!")
+    if cfg.get("ssh_host"): print(f"🌍 SSH NL VPS: {cfg['ssh_user']}@{cfg['ssh_host']}:{cfg['ssh_port']}")
+    else: print("⚠️ SSH не настроен — YouTube загрузка локальная")
 
-    # Еженедельная очистка Яндекс.Диска
+    # Фоновые потоки
+    threading.Thread(target=_yt_check_subscriptions_thread,daemon=True).start()
     def _yadisk_weekly():
         while True:
             time.sleep(7*24*3600)
@@ -2449,6 +3163,7 @@ def main():
                 except Exception as e:
                     logger.error(f"YaDisk cleanup scheduler: {e}")
     threading.Thread(target=_yadisk_weekly,daemon=True).start()
+
     while True:
         try:
             for event in longpoll.listen():
@@ -2887,7 +3602,7 @@ update_bot_scripts() {
             || echo -e "  ${RED}❌ Ошибка установки TG зависимостей${NC}"
     fi
     if is_installed vk && [ -f "$VK_DIR/venv/bin/pip" ]; then
-        "$VK_DIR/venv/bin/pip" install --quiet Pillow qrcode yt-dlp \
+        "$VK_DIR/venv/bin/pip" install --quiet Pillow qrcode yt-dlp requests \
             && echo -e "  ${GREEN}✅ VK venv: Pillow qrcode yt-dlp${NC}" \
             || echo -e "  ${RED}❌ Ошибка установки VK зависимостей${NC}"
     fi
