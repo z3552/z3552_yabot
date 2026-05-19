@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v6.8
+# Автор: z3552[Reenpak]  |  yabot_installer v7.2
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -275,12 +275,15 @@ get_user_inputs_vk() {
     [ -z "$VK_TOKEN" ] && echo -e "${RED}❌ Токен не может быть пустым${NC}" && exit 1
     echo ""; read -p "ID сообщества VK (число, со знаком минус или без): " VK_GROUP_ID
     [ -z "$VK_GROUP_ID" ] && echo -e "${RED}❌ ID не может быть пустым${NC}" && exit 1
-    # Убираем минус если вдруг вставили из API-ответа (например -12345678 → 12345678)
     VK_GROUP_ID="${VK_GROUP_ID#-}"
     [[ ! "$VK_GROUP_ID" =~ ^[0-9]+$ ]] && echo -e "${RED}❌ ID должен быть числом${NC}" && exit 1
     echo ""; read -p "VK User ID(s) через запятую: " VK_USER_IDS
     [ -z "$VK_USER_IDS" ] && echo -e "${RED}❌ Нужен хотя бы один ID${NC}" && exit 1
     VK_USER_IDS=$(echo "$VK_USER_IDS" | tr -d ' ')
+    echo ""
+    echo -e "${YELLOW}Яндекс.Диск OAuth токен (для отправки видео >200 MB).${NC}"
+    echo -e "${YELLOW}Получить: https://oauth.yandex.ru → создать приложение → права cloud_api:disk.write,read${NC}"
+    read -p "Yandex OAuth Token (Enter — пропустить): " YADISK_TOKEN
     echo -e "${GREEN}✅ Данные VK собраны${NC}"; echo ""
 }
 
@@ -325,7 +328,7 @@ create_shared_config() {
 
     if $INSTALL_VK; then
         VK_USERS_JSON=$(echo "$VK_USER_IDS"|tr ','  '\n'|sed 's/^[[:space:]]*//'|jq -R 'tonumber'|jq -s '.')
-        VK_BLOCK="\"vk\":{\"group_token\":\"$VK_TOKEN\",\"group_id\":$VK_GROUP_ID,\"allowed_users\":$VK_USERS_JSON,\"user_token\":\"$VK_USER_TOKEN\"}"
+        VK_BLOCK="\"vk\":{\"group_token\":\"$VK_TOKEN\",\"group_id\":$VK_GROUP_ID,\"allowed_users\":$VK_USERS_JSON,\"user_token\":\"$VK_USER_TOKEN\",\"yadisk_token\":\"$YADISK_TOKEN\"}"
     else
         VK_BLOCK='"vk":null'
     fi
@@ -1556,6 +1559,7 @@ def load_cfg():
             "group_token":v.get("group_token",""),"group_id":int(v.get("group_id",0)),
             "allowed_users":[int(u) for u in v.get("allowed_users",[])],
             "user_token":v.get("user_token",""),
+            "yadisk_token":v.get("yadisk_token",""),
             "tg_installed":"tg" in (d.get("installed") or [])}
 
 cfg=load_cfg()
@@ -1663,18 +1667,32 @@ def run_vkpanel_vk(n,timeout=20):
 def run_xui_vk(n,timeout=20):
     return run_cmd_vk(f'echo "{n}" | x-ui',timeout)
 
-def vk_upload_doc(uid,content_bytes,filename,title=""):
-    """Загружает файл как VK-документ, возвращает attachment-строку."""
+def vk_upload_doc(uid,fpath,filename,title=""):
+    """Загружает файл как VK-документ (принимает путь, не байты)."""
+    import requests as req
     if vk_session_global is None: raise RuntimeError("vk_session_global не инициализирован")
-    with tempfile.NamedTemporaryFile(delete=False,suffix="_"+filename) as f:
-        f.write(content_bytes); fpath=f.name
-    try:
-        upload=vk_api.VkUpload(vk_session_global)
-        result=upload.document_message(fpath,peer_id=uid,title=title or filename)
-        doc=result[0]["doc"] if isinstance(result,list) else result.get("doc",result)
-        return f"doc{doc['owner_id']}_{doc['id']}"
-    finally:
-        os.unlink(fpath)
+    vk=vk_session_global.get_api()
+
+    # Получаем URL сервера загрузки
+    upload_info=vk.docs.getMessagesUploadServer(peer_id=uid)
+    upload_url=upload_info["upload_url"]
+
+    # Загружаем потоком без загрузки в RAM, таймаут 10 минут
+    with open(fpath,"rb") as fp:
+        r=req.post(upload_url,
+            files={"file":(filename,fp,"application/octet-stream")},
+            timeout=600)
+    r.raise_for_status()
+    if not r.text.strip():
+        raise RuntimeError("VK upload server вернул пустой ответ")
+    data=r.json()
+    if "file" not in data:
+        raise RuntimeError(f"VK upload error: {data}")
+
+    # Сохраняем документ
+    saved=vk.docs.save(file=data["file"],title=title or filename)
+    doc=saved[0] if isinstance(saved,list) else saved.get("doc",saved)
+    return f"doc{doc['owner_id']}_{doc['id']}"
 
 def vk_upload_photo(uid,png_bytes):
     """Загружает PNG-байты как VK-фото, возвращает attachment-строку."""
@@ -1770,25 +1788,54 @@ def send_attach(vk,uid,text,attachment,kbd=None):
     vk.messages.send(**p)
 
 # ── Основной обработчик ───────────────────────────────────────
-def _yt_download_and_send(vk,uid,url,title,fmt,st):
-    """Скачивает YouTube видео с ограничением CPU, отправляет как документ."""
-    ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
+YA_API="https://cloud-api.yandex.net/v1/disk/resources"
+YA_FOLDER="/yt_bot_videos"
 
-    # Выбираем враппер для ограничения CPU
-    # cpulimit -l 60 -- ограничивает процесс до 60% CPU
-    cpulimit=["cpulimit","-l","60","--"] if subprocess.run(
-        ["which","cpulimit"],capture_output=True).returncode==0 else []
+def yadisk_upload(token,local_path,filename):
+    """Загружает файл на Яндекс.Диск, делает публичным, возвращает ссылку."""
+    import requests as req
+    h={"Authorization":f"OAuth {token}"}
+    remote=f"{YA_FOLDER}/{filename}"
+
+    # Создаём папку если нет
+    req.put(YA_API,headers=h,params={"path":YA_FOLDER})
+
+    # Получаем URL для загрузки
+    r=req.get(f"{YA_API}/upload",headers=h,
+              params={"path":remote,"overwrite":"true"},timeout=30)
+    r.raise_for_status()
+    upload_url=r.json()["href"]
+
+    # Загружаем файл потоком (не читаем в RAM)
+    with open(local_path,"rb") as f:
+        r=req.put(upload_url,data=f,timeout=600)
+    r.raise_for_status()
+
+    # Публикуем
+    req.put(f"{YA_API}/publish",headers=h,params={"path":remote},timeout=30)
+
+    # Получаем публичную ссылку
+    r=req.get(YA_API,headers=h,params={"path":remote},timeout=30)
+    r.raise_for_status()
+    return r.json().get("public_url","")
+
+def _yt_download_and_send(vk,uid,url,title,fmt,st):
+    """Скачивает YouTube видео с ограничением CPU, отправляет через Яндекс.Диск или как документ."""
+    ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
 
     send(vk,uid,f"⏳ Скачиваю «{title}»...")
     with tempfile.TemporaryDirectory() as tmp:
         out=f"{tmp}/video.%(ext)s"
         try:
-            cmd=cpulimit+["nice","-n","19","ionice","-c","3",
-                ytdlp,"-f",fmt,
-                "--merge-output-format","mp4",
-                "--postprocessor-args","ffmpeg:-c:v copy -c:a aac -threads 2",
-                "--no-playlist","--socket-timeout","30",
-                "-o",out,"--no-part",url]
+            # cpulimit -i — рекурсивно ограничивает все дочерние процессы (ffmpeg тоже)
+            cpulimit_ok=subprocess.run(["which","cpulimit"],capture_output=True).returncode==0
+            cmd=(["cpulimit","-i","-l","60","--"] if cpulimit_ok else [])+\
+                ["nice","-n","19","ionice","-c","3",
+                 ytdlp,"-f",fmt,
+                 "--merge-output-format","mp4",
+                 "--postprocessor-args","ffmpeg:-c:v copy -c:a aac -threads 1",
+                 "--no-playlist","--socket-timeout","30",
+                 "-o",out,"--no-part",url]
             r=subprocess.run(cmd,
                 capture_output=True,text=True,timeout=600,
                 env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
@@ -1813,8 +1860,23 @@ def _yt_download_and_send(vk,uid,url,title,fmt,st):
 
             sz=os.path.getsize(vpath)/(1024*1024)
             send(vk,uid,f"⬆️ Отправляю ({sz:.1f} MB)...")
-            with open(vpath,"rb") as f:
-                att=vk_upload_doc(uid,f.read(),os.path.basename(vpath),"YouTube видео")
+
+            yadisk_token=cfg.get("yadisk_token","")
+            use_yadisk=yadisk_token and sz>1000  # Яндекс.Диск для файлов > 1 GB
+
+            if use_yadisk:
+                fname=f"{int(time.time())}_{os.path.basename(vpath)}"
+                pub_url=yadisk_upload(yadisk_token,vpath,fname)
+                if pub_url:
+                    cur_kbd={"main":kbd_main,"tools":kbd_tools}.get(st,kbd_main)()
+                    send(vk,uid,f"📹 {title} ({sz:.1f} MB)\n🔗 Скачать: {pub_url}",cur_kbd)
+                    db.log_command("vk",uid,f"yt {url[:80]}",f"yadisk {sz:.1f}MB",True)
+                    return
+                # Если Яндекс.Диск не сработал — падаем в document upload
+                send(vk,uid,"⚠️ Яндекс.Диск недоступен, пробую через VK...")
+
+            # Прямая загрузка в VK (до 4 GB, таймаут 10 минут)
+            att=vk_upload_doc(uid,vpath,os.path.basename(vpath),"YouTube видео")
             cur_kbd={"main":kbd_main,"tools":kbd_tools}.get(st,kbd_main)()
             send_attach(vk,uid,f"📹 {title} ({sz:.1f} MB)",att,cur_kbd)
             db.log_command("vk",uid,f"yt {url[:80]}",f"{sz:.1f}MB",True)
@@ -1934,16 +1996,19 @@ def handle(vk,uid,text):
         try:
             import zipfile
             conf_bytes=out.encode()
-            att=vk_upload_doc(uid,conf_bytes,f"{name}.conf",f"WG {name}.conf")
+            # conf — записываем в tmp
+            with tempfile.NamedTemporaryFile(delete=False,suffix=f"_{name}.conf") as cf:
+                cf.write(conf_bytes); cpath=cf.name
+            att=vk_upload_doc(uid,cpath,f"{name}.conf",f"WG {name}.conf")
+            os.unlink(cpath)
             send_attach(vk,uid,f"🔑 Туннель конфиг: {name}",att,kbd_wg())
             # Дополнительно zip
             with tempfile.NamedTemporaryFile(delete=False,suffix=".zip") as zf_tmp:
                 zpath=zf_tmp.name
             with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr(f"{name}.conf",out)
-            with open(zpath,'rb') as f: zip_bytes=f.read()
+            att2=vk_upload_doc(uid,zpath,f"{name}.zip",f"WG {name}.zip")
             os.unlink(zpath)
-            att2=vk_upload_doc(uid,zip_bytes,f"{name}.zip",f"WG {name}.zip")
             send_attach(vk,uid,f"📦 ZIP архив: {name}",att2)
             db.log_command("vk",uid,f"wg getuser {name}","отправлен .conf+.zip",True)
         except Exception as e:
@@ -2341,11 +2406,13 @@ update_config() {
         CUR_VK_GRP=$(jq -r '.vk.group_id' "$SHARED_CONFIG")
         CUR_VK_USR=$(jq -r '.vk.allowed_users|join(",")' "$SHARED_CONFIG")
         CUR_VK_UTOK=$(jq -r '.vk.user_token // ""' "$SHARED_CONFIG")
+        CUR_YADISK=$(jq -r '.vk.yadisk_token // ""' "$SHARED_CONFIG")
         echo -e "${BLUE}── 🟦 ВКонтакте ──${NC}"
         read -p "VK токен [Enter — не менять]: " NVK_TOK; NVK_TOK=${NVK_TOK:-$CUR_VK_TOK}
         read -p "VK группа ID [$CUR_VK_GRP]: " NVK_GRP; NVK_GRP=${NVK_GRP:-$CUR_VK_GRP}
         NVK_GRP="${NVK_GRP#-}"  # убираем минус если вставили из API
         read -p "VK пользователи [$CUR_VK_USR]: " NVK_USR; NVK_USR=${NVK_USR:-$CUR_VK_USR}
+        read -p "Yandex OAuth Token [Enter — не менять]: " NYADISK; NYADISK=${NYADISK:-$CUR_YADISK}
         echo ""
     fi
 
@@ -2371,7 +2438,7 @@ update_config() {
     VK_BLOCK='"vk":null'
     if is_installed vk; then
         VKU=$(echo "$NVK_USR"|tr ','  '\n'|sed 's/^[[:space:]]*//'|jq -R 'tonumber'|jq -s '.')
-        VK_BLOCK="\"vk\":{\"group_token\":\"$NVK_TOK\",\"group_id\":$NVK_GRP,\"allowed_users\":$VKU,\"user_token\":\"$NVK_UTOK\"}"
+        VK_BLOCK="\"vk\":{\"group_token\":\"$NVK_TOK\",\"group_id\":$NVK_GRP,\"allowed_users\":$VKU,\"user_token\":\"$NVK_UTOK\",\"yadisk_token\":\"$NYADISK\"}"
     fi
 
     printf '{"installed":%s,"vm_id":"%s","folder_id":"%s","admin_pin":"%s",%s,%s}\n' \
