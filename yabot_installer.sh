@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v6.2
+# Автор: z3552[Reenpak]  |  yabot_installer v6.3
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -1770,41 +1770,104 @@ def send_attach(vk,uid,text,attachment,kbd=None):
     vk.messages.send(**p)
 
 # ── Основной обработчик ───────────────────────────────────────
+def _yt_download_and_send(vk,uid,url,title,fmt,st):
+    """Скачивает YouTube видео, проверяет через ffprobe, отправляет как документ."""
+    ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
+    send(vk,uid,f"⏳ Скачиваю «{title}»...")
+    with tempfile.TemporaryDirectory() as tmp:
+        out=f"{tmp}/video.%(ext)s"
+        try:
+            r=subprocess.run([ytdlp,"-f",fmt,
+                "--merge-output-format","mp4",
+                "--postprocessor-args","ffmpeg:-c:v copy -c:a aac",
+                "--no-playlist","--socket-timeout","30",
+                "-o",out,"--no-part",url],
+                capture_output=True,text=True,timeout=300,
+                env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
+            if r.returncode!=0:
+                send(vk,uid,f"❌ Ошибка:\n{(r.stderr or r.stdout)[-400:]}"); return
+            files=glob.glob(f"{tmp}/video.*") or glob.glob(f"{tmp}/*.mp4")
+            if not files: send(vk,uid,"❌ Файл не найден"); return
+            vpath=files[0]
+
+            # ── ffprobe: проверяем наличие и видео и аудио ──────────────
+            probe=subprocess.run(
+                ["ffprobe","-v","error","-show_entries","stream=codec_type",
+                 "-of","csv=p=0",vpath],
+                capture_output=True,text=True)
+            streams=probe.stdout.strip().split("\n") if probe.returncode==0 else []
+            has_video="video" in streams; has_audio="audio" in streams
+
+            if not has_audio and fmt!="bestvideo+bestaudio/best":
+                # Аудио отсутствует — перекачиваем без дубляжа
+                logger.warning(f"Нет аудио в {vpath}, перекачиваю без дубляжа")
+                send(vk,uid,"⚠️ Аудио не найдено в дубляже, скачиваю оригинал...")
+                _yt_download_and_send(vk,uid,url,title,"bestvideo+bestaudio/best",st)
+                return
+            if not has_video:
+                send(vk,uid,"❌ Видео не найдено в файле"); return
+
+            sz=os.path.getsize(vpath)/(1024*1024)
+            send(vk,uid,f"⬆️ Отправляю ({sz:.1f} MB)...")
+            with open(vpath,"rb") as f:
+                att=vk_upload_doc(uid,f.read(),os.path.basename(vpath),"YouTube видео")
+            cur_kbd={"main":kbd_main,"tools":kbd_tools}.get(st,kbd_main)()
+            send_attach(vk,uid,f"📹 {title} ({sz:.1f} MB)",att,cur_kbd)
+            db.log_command("vk",uid,f"yt {url[:80]}",f"{sz:.1f}MB",True)
+        except subprocess.TimeoutExpired:
+            send(vk,uid,"⏱ Таймаут. Попробуй более короткое видео.")
+        except Exception as e:
+            send(vk,uid,f"❌ {e}")
+
 def handle(vk,uid,text):
     if uid not in cfg["allowed_users"]: send(vk,uid,"⛔ Нет доступа"); return
     st=states.get(uid,"main"); text=text.strip()
 
     # ── YouTube: автодетект ссылок в любом состоянии ────────────
     if re.search(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+',text):
-        send(vk,uid,"⏳ Скачиваю видео...")
+        send(vk,uid,"🔍 Получаю информацию о видео...")
         ytdlp=str(VK_DIR.parent/"tg/venv/bin/yt-dlp")
-        with tempfile.TemporaryDirectory() as tmp:
-            out=f"{tmp}/video.%(ext)s"
-            try:
-                r=subprocess.run([ytdlp,
-                    "-f","bestvideo+bestaudio/best",
-                    "--merge-output-format","mp4",
-                    "--postprocessor-args","ffmpeg:-c:v copy -c:a aac",
-                    "--no-playlist","--socket-timeout","30",
-                    "-o",out,"--no-part",text],
-                    capture_output=True,text=True,timeout=300,
-                    env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
-                if r.returncode!=0:
-                    send(vk,uid,f"❌ Ошибка:\n{(r.stderr or r.stdout)[-400:]}"); return
-                files=glob.glob(f"{tmp}/video.*") or glob.glob(f"{tmp}/*.mp4")
-                if not files: send(vk,uid,"❌ Файл не найден"); return
-                vpath=files[0]; sz=os.path.getsize(vpath)/(1024*1024)
-                send(vk,uid,f"⬆️ Отправляю ({sz:.1f} MB)...")
-                with open(vpath,"rb") as f:
-                    att=vk_upload_doc(uid,f.read(),
-                        os.path.basename(vpath),"YouTube видео")
-                cur_kbd={"main":kbd_main,"tools":kbd_tools}.get(st,kbd_main)()
-                send_attach(vk,uid,f"📹 YouTube ({sz:.1f} MB)",att,cur_kbd)
-                db.log_command("vk",uid,f"yt {text[:80]}",f"{sz:.1f}MB",True)
-            except subprocess.TimeoutExpired:
-                send(vk,uid,"⏱ Таймаут. Попробуй более короткое видео.")
-            except Exception as e:
-                send(vk,uid,f"❌ {e}")
+
+        # Получаем метаданные для дубляжей
+        title="YouTube"; dubbed=[]
+        try:
+            import yt_dlp as yt_dlp_lib
+            with yt_dlp_lib.YoutubeDL({"quiet":True,"no_warnings":True,"noplaylist":True}) as ydl:
+                info=ydl.extract_info(text,download=False)
+            title=info.get("title","YouTube")[:60]
+            for f in (info.get("formats") or []):
+                note=(f.get("format_note") or "").lower()
+                lang=f.get("language") or ""
+                if f.get("acodec")!="none" and f.get("vcodec")=="none":
+                    if "dubbed" in note or "дубляж" in note or (lang and lang not in ("en","und","")):
+                        dubbed.append({"lang":lang,"label":f"{lang.upper()} дубляж" if lang else note,"fid":f["format_id"]})
+        except Exception as e:
+            logger.warning(f"yt metadata: {e}")
+
+        if dubbed:
+            dub_list="\n".join([f"{i+1}. {d['label']}" for i,d in enumerate(dubbed)])
+            send(vk,uid,f"🎬 {title}\n\nДоступны дубляжи:\n{dub_list}\n{len(dubbed)+1}. Оригинал\n\nОтветь номером:")
+            states[uid]="yt_dub_choice"
+            pending[uid]={"url":text,"dubbed":dubbed,"title":title}
+            return
+
+        # Нет дубляжей — скачиваем сразу
+        _yt_download_and_send(vk,uid,text,title,"bestvideo+bestaudio/best",st)
+        return
+
+    elif st=="yt_dub_choice":
+        data=pending.pop(uid,{})
+        url=data.get("url",""); dubbed=data.get("dubbed",[]); title=data.get("title","YouTube")
+        try: choice=int(text.strip())-1
+        except: send(vk,uid,"❌ Введи номер из списка"); return
+        if choice==len(dubbed):
+            fmt="bestvideo+bestaudio/best"
+        elif 0<=choice<len(dubbed):
+            fmt=f"bestvideo+{dubbed[choice]['fid']}/bestvideo+bestaudio/best"
+        else:
+            send(vk,uid,"❌ Неверный номер"); return
+        states[uid]="main"
+        _yt_download_and_send(vk,uid,url,title,fmt,st)
         return
 
     if text.lower() in ("начать","start","/start","меню"):
