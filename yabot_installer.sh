@@ -1790,21 +1790,17 @@ def _yt_download_and_send(vk,uid,url,title,fmt,st):
             if not files: send(vk,uid,"❌ Файл не найден"); return
             vpath=files[0]
 
-            # ── ffprobe: проверяем наличие и видео и аудио ──────────────
+            # ffprobe: проверяем наличие видео и аудио
             probe=subprocess.run(
                 ["ffprobe","-v","error","-show_entries","stream=codec_type",
                  "-of","csv=p=0",vpath],
                 capture_output=True,text=True)
             streams=probe.stdout.strip().split("\n") if probe.returncode==0 else []
-            has_video="video" in streams; has_audio="audio" in streams
-
-            if not has_audio and fmt!="bestvideo+bestaudio/best":
-                # Аудио отсутствует — перекачиваем без дубляжа
-                logger.warning(f"Нет аудио в {vpath}, перекачиваю без дубляжа")
+            if "audio" not in streams and fmt!="bestvideo+bestaudio/best":
                 send(vk,uid,"⚠️ Аудио не найдено в дубляже, скачиваю оригинал...")
                 _yt_download_and_send(vk,uid,url,title,"bestvideo+bestaudio/best",st)
                 return
-            if not has_video:
+            if "video" not in streams:
                 send(vk,uid,"❌ Видео не найдено в файле"); return
 
             sz=os.path.getsize(vpath)/(1024*1024)
