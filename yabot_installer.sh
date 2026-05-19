@@ -1070,6 +1070,19 @@ async def back_main(u,c): await u.message.reply_text("Главное меню",r
 async def tools_menu(u,c):
     await u.message.reply_text("🔧 <b>Инструменты</b>",parse_mode="HTML",reply_markup=kbd_tools())
 
+@check_access
+async def yt_tools_menu(u,c):
+    try:
+        import json as _j
+        ssh_ok=bool(_j.load(open(CONFIG_FILE)).get("ssh_vps",{}).get("host","") if (BASE_DIR/"config.json").exists() else "")
+    except: ssh_ok=False
+    ssh_info="🌍 Загрузка через ВМ Яндекс.Облака (быстрый канал)" if ssh_ok else "☁️ Прямая загрузка на Яндекс.Диск"
+    await u.message.reply_text(
+        f"🎬 <b>YouTube</b>\n\n{ssh_info}\n\n"
+        "Просто отправь ссылку на видео — скачаю и пришлю.\n"
+        "Полный YouTube-интерфейс (поиск, подписки) — в VK боте.",
+        parse_mode="HTML", reply_markup=kbd_tools())
+
 # ── 💻 КОНСОЛЬ ───────────────────────────────────────────────
 @check_access
 async def console_menu(u,c):
