@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v8.4
+# Автор: z3552[Reenpak]  |  yabot_installer v8.7
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -297,6 +297,7 @@ get_user_inputs_vk() {
         YC_VM_SSH_USER="${YC_VM_SSH_USER:-ubuntu}"
         read -p "Путь к SSH ключу (Enter — без SSH, загрузка с NL VPS): " YC_VM_SSH_KEY
         if [ -n "$YC_VM_SSH_KEY" ]; then
+            [ ! -f "$YC_VM_SSH_KEY" ] && echo -e "${RED}⚠️  Файл ключа не найден: $YC_VM_SSH_KEY${NC}"
             echo -e "${GREEN}✅ SSH загрузка: ${YC_VM_SSH_USER}@<vm_ip_из_yc> ключ ${YC_VM_SSH_KEY}${NC}"
         else
             echo -e "${YELLOW}⚠️  Без SSH ключа — загрузка пойдёт напрямую с NL VPS${NC}"
@@ -588,10 +589,11 @@ create_tg_bot_script() {
     cat > "$TG_DIR/vm_bot.py" << 'TGEOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Telegram бот управления ВМ Яндекс.Облака. v4.2"""
+"""Telegram бот управления ВМ Яндекс.Облака. v5.0"""
 
-import asyncio, json, logging, os, subprocess, sys, io, re, tempfile
+import asyncio, json, logging, os, subprocess, sys, io, re, tempfile, glob, threading
 from pathlib import Path
+from functools import partial
 import pytz
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (Application, CommandHandler, MessageHandler,
@@ -599,6 +601,7 @@ from telegram.ext import (Application, CommandHandler, MessageHandler,
 
 BASE_DIR = Path("/opt/vm_manager"); TG_DIR = BASE_DIR / "tg"
 CONFIG_FILE = BASE_DIR / "config.json"; LOG_FILE = TG_DIR / "bot.log"
+ADMIN_FILE = BASE_DIR / "admins.json"; YT_SUBS_FILE = BASE_DIR / "yt_subs.json"
 BASE_DIR.mkdir(parents=True, exist_ok=True); TG_DIR.mkdir(parents=True, exist_ok=True)
 
 sys.path.insert(0, str(BASE_DIR))
@@ -609,8 +612,7 @@ SETTINGS_FILE = BASE_DIR / "settings.json"
 
 def get_sensitive():
     try:
-        if SETTINGS_FILE.exists():
-            return json.load(open(SETTINGS_FILE)).get("sensitive_mode", False)
+        if SETTINGS_FILE.exists(): return json.load(open(SETTINGS_FILE)).get("sensitive_mode", False)
     except: pass
     return False
 
@@ -620,13 +622,16 @@ def set_sensitive(val):
         if SETTINGS_FILE.exists(): s = json.load(open(SETTINGS_FILE))
     except: pass
     s["sensitive_mode"] = val
-    with open(SETTINGS_FILE,"w") as f: json.dump(s,f)
+    with open(SETTINGS_FILE, "w") as f: json.dump(s, f)
 
+# ── ConversationHandler состояния ────────────────────────────
 (SET_START_TIME, SET_STOP_TIME, SET_RETENTION, AWAIT_DELETE_PIN,
- CONSOLE_INPUT,
- WG_ADDUSER_NAME, WG_GETUSER_NAME, WG_DELUSER_NAME, WG_DELUSER_PIN,
- VKPANEL_STOP_PIN,
- XUI_STOP_PIN, XUI_PORT_PIN, XUI_PORT_INPUT, XUI_RESET_PIN) = range(14)
+ CONSOLE_INPUT, WG_ADDUSER_NAME, WG_GETUSER_NAME, WG_DELUSER_NAME, WG_DELUSER_PIN,
+ VKPANEL_STOP_PIN, XUI_STOP_PIN, XUI_PORT_PIN, XUI_PORT_INPUT, XUI_RESET_PIN,
+ TG_YT_DUB, TG_YT_QUAL, TG_YT_SEARCH, TG_YT_SEARCH_PICK,
+ TG_YT_CHAN, TG_YT_CHAN_PICK, TG_YT_SUB, TG_YT_UNSUB_PICK,
+ TG_ADMIN_ADD, TG_ADMIN_ADD_PIN, TG_ADMIN_REMOVE, TG_ADMIN_REMOVE_PIN,
+ TG_ADMIN_FEATURES, TG_ADMIN_BROADCAST) = range(28)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO,
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()])
@@ -636,6 +641,7 @@ class Config:
     def __init__(self):
         self.bot_token=""; self.allowed_users=[]; self.vm_id=""
         self.folder_id=""; self.admin_pin=""; self.vk_installed=False
+        self.yadisk_token=""; self.yadisk_ssh_user="ubuntu"; self.yadisk_ssh_key=""
         self.load()
     def load(self):
         try:
@@ -645,6 +651,10 @@ class Config:
             tg=d.get("tg") or {}
             self.bot_token=tg.get("bot_token",""); self.allowed_users=tg.get("allowed_users",[])
             self.vk_installed="vk" in (d.get("installed") or [])
+            vk=d.get("vk") or {}
+            self.yadisk_token=vk.get("yadisk_token","")
+            self.yadisk_ssh_user=vk.get("yadisk_ssh_user","ubuntu")
+            self.yadisk_ssh_key=vk.get("yadisk_ssh_key","")
         except Exception as e: logger.error(f"Config error: {e}")
 
 config = Config()
@@ -670,6 +680,31 @@ class Schedule:
                        "start_time":self.start_time,"stop_time":self.stop_time},f,indent=2)
 schedule_config = Schedule()
 
+# ── Система ролей ─────────────────────────────────────────────
+def load_admin():
+    if ADMIN_FILE.exists():
+        try: return json.load(open(ADMIN_FILE))
+        except: pass
+    return {"extra_users":[],"user_labels":{},"disabled_features":{},
+            "global_disabled":["vm_control","terminal","tunnel","xui","vkpanel"]}
+
+def save_admin(data):
+    with open(ADMIN_FILE,"w") as f: json.dump(data,f,indent=2,ensure_ascii=False)
+
+def is_admin(uid):
+    return uid in [int(u) for u in config.allowed_users]
+
+def get_all_users():
+    base=[int(u) for u in config.allowed_users]
+    extra=[int(u) for u in load_admin().get("extra_users",[])]
+    return list(dict.fromkeys(base+extra))
+
+def user_can(uid, feature):
+    if is_admin(uid): return True
+    data=load_admin()
+    if feature in data.get("global_disabled",[]): return False
+    return feature not in data.get("disabled_features",{}).get(str(uid),[])
+
 class YandexCloudVM:
     _ENV={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin:/root/yandex-cloud/bin"}
     @staticmethod
@@ -688,32 +723,20 @@ class YandexCloudVM:
         return False,out,None
     @staticmethod
     def start():
-        import time
         ok,s,_=YandexCloudVM.get_status()
         if not ok: return False,f"Нет статуса: {s}"
         if s=="RUNNING": return True,"ВМ уже запущена"
         if s=="STARTING": return True,"ВМ уже запускается"
         if s not in ["STOPPED","STOPPING"]: return False,f"Запуск невозможен: {s}"
-        if s=="STOPPING":
-            for _ in range(12):
-                time.sleep(10); ok,s,_=YandexCloudVM.get_status()
-                if ok and s=="STOPPED": break
-            else: return False,"ВМ не остановилась за 2 мин"
         ok,out=YandexCloudVM._run(["yc","compute","instance","start",config.vm_id])
         return (True,"✅ ВМ запущена") if ok else (False,f"Ошибка: {out}")
     @staticmethod
     def stop():
-        import time
         ok,s,_=YandexCloudVM.get_status()
         if not ok: return False,f"Нет статуса: {s}"
         if s=="STOPPED": return True,"ВМ уже остановлена"
         if s=="STOPPING": return True,"ВМ уже останавливается"
         if s not in ["RUNNING","STARTING"]: return False,f"Остановка невозможна: {s}"
-        if s=="STARTING":
-            for _ in range(12):
-                time.sleep(10); ok,s,_=YandexCloudVM.get_status()
-                if ok and s=="RUNNING": break
-            else: return False,"ВМ не запустилась за 2 мин"
         ok,out=YandexCloudVM._run(["yc","compute","instance","stop",config.vm_id])
         return (True,"✅ ВМ остановлена") if ok else (False,f"Ошибка: {out}")
     @staticmethod
@@ -753,9 +776,7 @@ def ctrl_svc(svc,action):
             if r.returncode==0 else (False,f"❌ {r.stderr.strip()}")
     except Exception as e: return False,f"❌ {e}"
 
-# ── Утилиты для новых разделов ───────────────────────────────
 def run_cmd(cmd_str, timeout=30):
-    """Неинтерактивная shell-команда. Возвращает (ok, output[≤4000])."""
     try:
         r=subprocess.run(cmd_str,shell=True,capture_output=True,text=True,timeout=timeout,
                         env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
@@ -764,11 +785,8 @@ def run_cmd(cmd_str, timeout=30):
     except subprocess.TimeoutExpired: return False,f"⏱ Таймаут {timeout}с"
     except Exception as e: return False,str(e)
 
-def run_vkpanel(n, timeout=20):
-    return run_cmd(f'echo "{n}" | vk-panel', timeout)
-
-def run_xui(n, timeout=20):
-    return run_cmd(f'echo "{n}" | x-ui', timeout)
+def run_vkpanel(n, timeout=20): return run_cmd(f'echo "{n}" | vk-panel', timeout)
+def run_xui(n, timeout=20): return run_cmd(f'echo "{n}" | x-ui', timeout)
 
 def make_qr_bytes(text):
     import qrcode
@@ -778,9 +796,23 @@ def make_qr_bytes(text):
 # ── Проверка доступа ─────────────────────────────────────────
 def check_access(func):
     async def wrapper(update:Update,context:ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in config.allowed_users:
+        uid = update.effective_user.id
+        if uid not in get_all_users():
             await update.message.reply_text("⛔️ Нет доступа"); return ConversationHandler.END
         return await func(update,context)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+def admin_only(func):
+    async def wrapper(update:Update,context:ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if uid not in get_all_users():
+            await update.message.reply_text("⛔️ Нет доступа"); return ConversationHandler.END
+        if not is_admin(uid):
+            await update.message.reply_text("⛔️ Только для администратора")
+            return ConversationHandler.END
+        return await func(update,context)
+    wrapper.__name__ = func.__name__
     return wrapper
 
 # ── Клавиатуры ───────────────────────────────────────────────
@@ -800,6 +832,14 @@ def kbd_tools():
         [KeyboardButton("💻 Терминал"),     KeyboardButton("🔑 Туннель")],
         [KeyboardButton("📡 Медиасервер"),  KeyboardButton("⚙️ Ядро")],
         [KeyboardButton("🎬 YouTube")],
+        [KeyboardButton("« Назад")],
+    ],resize_keyboard=True)
+
+def kbd_youtube():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("🔍 Поиск видео"),        KeyboardButton("▶️ Последние видео канала")],
+        [KeyboardButton("📺 Мои подписки"),        KeyboardButton("➕ Подписаться на канал")],
+        [KeyboardButton("➖ Отписаться от канала")],
         [KeyboardButton("« Назад")],
     ],resize_keyboard=True)
 
@@ -829,16 +869,28 @@ def kbd_history():
         [KeyboardButton("« Назад")],
     ],resize_keyboard=True)
 
-def kbd_settings():
+def kbd_settings(uid=None):
     lbl="🔒 Скрыть инструменты" if not get_sensitive() else "🔓 Показать инструменты"
-    return ReplyKeyboardMarkup([
-        [KeyboardButton(lbl)],
+    rows=[[KeyboardButton(lbl)]]
+    if uid and is_admin(uid): rows.append([KeyboardButton("👮 Администрирование")])
+    rows+=[
         [KeyboardButton("🗑️ Удалить бота с сервера")],
+        [KeyboardButton("« Назад")],
+    ]
+    return ReplyKeyboardMarkup(rows,resize_keyboard=True)
+
+def kbd_admin():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("➕ Добавить пользователя"), KeyboardButton("➖ Удалить пользователя")],
+        [KeyboardButton("📋 Список пользователей")],
+        [KeyboardButton("🔧 Функции пользователей")],
+        [KeyboardButton("📢 Рассылка")],
+        [KeyboardButton("⬆️ Обновить с GitHub")],
         [KeyboardButton("« Назад")],
     ],resize_keyboard=True)
 
-def kbd_console():
-    return ReplyKeyboardMarkup([[KeyboardButton("« Назад")]],resize_keyboard=True)
+def kbd_console(): return ReplyKeyboardMarkup([[KeyboardButton("« Назад")]],resize_keyboard=True)
+def kbd_back():    return ReplyKeyboardMarkup([[KeyboardButton("« Назад")]],resize_keyboard=True)
 
 def kbd_wg():
     return ReplyKeyboardMarkup([
@@ -862,43 +914,264 @@ def kbd_xui():
         [KeyboardButton("« Назад")],
     ],resize_keyboard=True)
 
-# ── Существующие обработчики ──────────────────────────────────
+# ── YouTube утилиты ──────────────────────────────────────────
+def _yt_get_meta_sync(url):
+    title="YouTube"; dubbed=[]
+    try:
+        import yt_dlp as yt
+        with yt.YoutubeDL({"quiet":True,"no_warnings":True,"noplaylist":True}) as ydl:
+            info=ydl.extract_info(url,download=False)
+        title=info.get("title","YouTube")[:60]
+        for f in (info.get("formats") or []):
+            note=(f.get("format_note") or "").lower(); lang=f.get("language") or ""
+            if f.get("acodec")!="none" and f.get("vcodec")=="none":
+                if "dubbed" in note or "дубляж" in note or (lang and lang not in ("en","und","")):
+                    dubbed.append({"lang":lang,"label":f"{lang.upper()} дубляж" if lang else note,"fid":f["format_id"]})
+    except Exception as e: logger.warning(f"yt_meta: {e}")
+    return title, dubbed
+
+def _yt_search_sync(query, n=5):
+    try:
+        import yt_dlp as yt
+        with yt.YoutubeDL({"quiet":True,"no_warnings":True,"extract_flat":True,"noplaylist":True}) as ydl:
+            info=ydl.extract_info(f"ytsearch{n}:{query}",download=False)
+        return [{"id":e.get("id",""),"title":e.get("title","")[:60],
+                 "url":f"https://youtu.be/{e.get('id','')}","channel":e.get("channel","")[:30]}
+                for e in (info.get("entries") or []) if e]
+    except Exception as e: logger.warning(f"yt_search: {e}"); return []
+
+
+def _normalize_yt_channel_tg(text):
+    """Преобразует разные форматы ввода в YouTube URL."""
+    text = text.strip()
+    # VK-формат: "@id416991442 (@SatiAkura)" → берём username в скобках
+    m = re.search(r'\(@([A-Za-z0-9_]+)\)', text)
+    if m:
+        text = f"@{m.group(1)}"
+    # Просто @username → полный URL
+    if re.match(r'^@[A-Za-z0-9_]+$', text):
+        return f"https://www.youtube.com/{text}"
+    # Уже URL — оставляем
+    return text
+
+def _yt_channel_info_sync(url):
+    try:
+        import yt_dlp as yt
+        opts={"quiet":True,"no_warnings":True,"extract_flat":"in_playlist",
+              "playlist_items":"1-10","noplaylist":False}
+        with yt.YoutubeDL(opts) as ydl:
+            info=ydl.extract_info(url,download=False)
+        cid=info.get("channel_id") or info.get("id","")
+        cname=info.get("channel") or info.get("title","")
+        videos=[{"id":e.get("id",""),"title":e.get("title","")[:60],
+                 "url":e.get("url") or f"https://youtu.be/{e.get('id','')}"}
+                for e in (info.get("entries") or [])[:5] if e]
+        return cid, cname, videos
+    except Exception as e: logger.warning(f"yt_channel: {e}"); return None, None, []
+
+def _yt_sponsorblock_check(video_id):
+    import requests as req
+    try:
+        r=req.get("https://sponsor.ajay.app/api/skipSegments",
+            params={"videoID":video_id,"categories":["sponsor","selfpromo","interaction","intro","outro"]},
+            timeout=10)
+        return r.json() if r.status_code==200 else []
+    except: return []
+
+def _yt_sponsorblock_cut(vpath, segments, out_path):
+    if not segments: return vpath
+    try:
+        conditions="+".join([f"between(t,{s['segment'][0]},{s['segment'][1]})" for s in segments])
+        r=subprocess.run(["ffmpeg","-y","-i",vpath,
+            "-vf",f"select='not({conditions})',setpts=N/FRAME_RATE/TB",
+            "-af",f"aselect='not({conditions})',asetpts=N/SR/TB",
+            "-c:v","libx264","-c:a","aac","-threads","1",out_path],
+            capture_output=True,timeout=300)
+        if r.returncode==0: return out_path
+    except Exception as e: logger.warning(f"sb cut: {e}")
+    return vpath
+
+def _yt_download_sync(url, fmt, safe_title, tmp_dir):
+    """Скачивает видео, возвращает (path, error_str)."""
+    ytdlp=str(TG_DIR/"venv/bin/yt-dlp")
+    out=f"{tmp_dir}/{safe_title}.%(ext)s"
+    r=subprocess.run(
+        [ytdlp,"-f",fmt,"--merge-output-format","mp4",
+         "--postprocessor-args","ffmpeg:-c:v libx264 -preset ultrafast -crf 23 -c:a aac -threads 1",
+         "--no-playlist","--socket-timeout","30","--restrict-filenames",
+         "-o",out,"--no-part",url],
+        capture_output=True,text=True,timeout=600,
+        preexec_fn=lambda: os.nice(19),
+        env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
+    if r.returncode!=0: return None,(r.stderr or r.stdout)[-400:]
+    files=glob.glob(f"{tmp_dir}/*.mp4") or glob.glob(f"{tmp_dir}/*.*")
+    return (files[0],None) if files else (None,"Файл не найден")
+
+def _yt_get_vm_ip():
+    try:
+        r=subprocess.run(["yc","compute","instance","get",config.vm_id,"--format","json"],
+            capture_output=True,text=True,timeout=30,
+            env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin:/root/yandex-cloud/bin"})
+        if r.returncode!=0: return None
+        d=json.loads(r.stdout)
+        for iface in d.get("network_interfaces",[]):
+            nat=iface.get("primary_v4_address",{}).get("one_to_one_nat",{})
+            if nat.get("address"): return nat["address"]
+    except: pass
+    return None
+
+def _yt_yadisk_upload_via_ssh(token, local_path, filename):
+    user=config.yadisk_ssh_user; key=config.yadisk_ssh_key
+    if not key: return None
+    vm_ip=_yt_get_vm_ip()
+    if not vm_ip: return None
+    remote_dir="/tmp/ytdl_yadisk"; remote_file=f"{remote_dir}/{filename}"
+    ya_path=f"/yt_bot_videos/{filename}"
+    ssh_opts=["-o","StrictHostKeyChecking=no","-o","ConnectTimeout=15","-o","BatchMode=yes","-i",key]
+    ssh_base=["ssh"]+ssh_opts+[f"{user}@{vm_ip}"]
+    scp_opts=["-o","StrictHostKeyChecking=no","-i",key]
+    try:
+        subprocess.run(ssh_base+[f"mkdir -p {remote_dir}"],timeout=15,capture_output=True)
+        r=subprocess.run(["scp"]+scp_opts+[local_path,f"{user}@{vm_ip}:{remote_file}"],
+            capture_output=True,text=True,timeout=600)
+        if r.returncode!=0: return None
+        subprocess.run(ssh_base+[f"curl -s -X PUT 'https://cloud-api.yandex.net/v1/disk/resources?path=/yt_bot_videos' -H 'Authorization: OAuth {token}'"],timeout=30,capture_output=True)
+        r2=subprocess.run(ssh_base+[f"curl -s 'https://cloud-api.yandex.net/v1/disk/resources/upload?path={ya_path}&overwrite=true' -H 'Authorization: OAuth {token}'"],capture_output=True,text=True,timeout=30)
+        upload_url=json.loads(r2.stdout).get("href","")
+        if not upload_url: subprocess.run(ssh_base+[f"rm -f {remote_file}"],timeout=10,capture_output=True); return None
+        subprocess.run(ssh_base+[f"curl -s -T '{remote_file}' '{upload_url}'"],capture_output=True,timeout=900)
+        subprocess.run(ssh_base+[f"curl -s -X PUT 'https://cloud-api.yandex.net/v1/disk/resources/publish?path={ya_path}' -H 'Authorization: OAuth {token}'"],timeout=30,capture_output=True)
+        r4=subprocess.run(ssh_base+[f"curl -s 'https://cloud-api.yandex.net/v1/disk/resources?path={ya_path}' -H 'Authorization: OAuth {token}'"],capture_output=True,text=True,timeout=30)
+        pub_url=json.loads(r4.stdout).get("public_url","")
+        subprocess.run(ssh_base+[f"rm -f {remote_file}"],timeout=10,capture_output=True)
+        return pub_url or None
+    except Exception as e: logger.error(f"yadisk_ssh: {e}"); return None
+
+def _yt_yadisk_upload_direct(token, local_path, filename):
+    import requests as req
+    h={"Authorization":f"OAuth {token}"}; ya_path=f"/yt_bot_videos/{filename}"
+    req.put("https://cloud-api.yandex.net/v1/disk/resources",headers=h,params={"path":"/yt_bot_videos"})
+    r=req.get("https://cloud-api.yandex.net/v1/disk/resources/upload",headers=h,
+              params={"path":ya_path,"overwrite":"true"},timeout=30)
+    r.raise_for_status()
+    with open(local_path,"rb") as f: req.put(r.json()["href"],data=f,timeout=600).raise_for_status()
+    req.put("https://cloud-api.yandex.net/v1/disk/resources/publish",headers=h,params={"path":ya_path},timeout=30)
+    r2=req.get("https://cloud-api.yandex.net/v1/disk/resources",headers=h,params={"path":ya_path},timeout=30)
+    return r2.json().get("public_url","")
+
+def load_yt_subs():
+    if YT_SUBS_FILE.exists():
+        try: return json.load(open(YT_SUBS_FILE))
+        except: pass
+    return {"channels":{}}
+
+def save_yt_subs(data):
+    with open(YT_SUBS_FILE,"w") as f: json.dump(data,f,indent=2,ensure_ascii=False)
+
+# ── Асинхронная загрузка и отправка YouTube ──────────────────
+async def _tg_yt_download_and_send(bot, uid, url, title, fmt):
+    safe_title=re.sub(r'[\\/*?:"<>|]','',title)[:60].strip() or "video"
+    fname=f"{safe_title}.mp4"
+    loop=asyncio.get_event_loop()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            vpath,err=await loop.run_in_executor(None,_yt_download_sync,url,fmt,safe_title,tmp)
+            if not vpath:
+                await bot.send_message(uid,f"❌ Ошибка скачивания:\n{err}"); return
+
+            # SponsorBlock
+            vid_m=re.search(r'(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})',url)
+            if vid_m:
+                segs=await loop.run_in_executor(None,_yt_sponsorblock_check,vid_m.group(1))
+                if segs:
+                    times=", ".join([f"{int(s['segment'][0]//60)}:{int(s['segment'][0]%60):02d}–"
+                                     f"{int(s['segment'][1]//60)}:{int(s['segment'][1]%60):02d}"
+                                     for s in segs[:5]])
+                    await bot.send_message(uid,f"⚠️ SponsorBlock: {len(segs)} реклам ({times})\n✂️ Вырезаю...")
+                    cut_path=os.path.join(tmp,f"{safe_title}_clean.mp4")
+                    vpath=await loop.run_in_executor(None,_yt_sponsorblock_cut,vpath,segs,cut_path)
+
+            sz=os.path.getsize(vpath)/(1024*1024)
+            await bot.send_message(uid,f"⬆️ Отправляю ({sz:.1f} MB)...")
+
+            token=config.yadisk_token
+            if sz>50 and not token:
+                await bot.send_message(uid,f"❌ Файл {sz:.0f} MB — в TG лимит 50 MB.\nДобавь Yandex.Disk токен через yabot → 7.")
+                return
+            if sz>50 and token:
+                pub_url=None
+                if config.yadisk_ssh_key:
+                    await bot.send_message(uid,"☁️ Загружаю через ВМ (быстрый канал)...")
+                    pub_url=await loop.run_in_executor(None,_yt_yadisk_upload_via_ssh,token,vpath,fname)
+                    if not pub_url:
+                        await bot.send_message(uid,"⚠️ SSH недоступен (ВМ выключена?), загружаю напрямую с NL VPS...")
+                if not pub_url:
+                    pub_url=await loop.run_in_executor(None,_yt_yadisk_upload_direct,token,vpath,fname)
+                if pub_url:
+                    await bot.send_message(uid,f"📹 <b>{safe_title}</b> ({sz:.1f} MB)\n🔗 <a href='{pub_url}'>Скачать с Яндекс.Диска</a>",parse_mode="HTML")
+                else:
+                    await bot.send_message(uid,"❌ Яндекс.Диск недоступен")
+                return
+            # Отправляем напрямую (≤50 MB)
+            await bot.send_document(uid,document=open(vpath,"rb"),filename=fname,
+                                    caption=f"📹 {safe_title} ({sz:.1f} MB)")
+            db.log_command("tg",uid,f"yt {url[:80]}",f"{sz:.1f}MB",True)
+        except Exception as e:
+            await bot.send_message(uid,f"❌ {e}")
+            logger.error(f"tg yt download: {e}")
+
+# ── Обработчики VM ────────────────────────────────────────────
 @check_access
-async def start_command(u,c): await u.message.reply_text("👋 Панель управления ВМ v4.5",reply_markup=kbd_main())
+async def start_command(u,c): await u.message.reply_text("👋 Панель управления ВМ v5.0",reply_markup=kbd_main())
 
 @check_access
 async def status_handler(u,c):
+    uid=u.effective_user.id
+    if not user_can(uid,"vm_control"):
+        await u.message.reply_text("⛔ Управление ВМ только для администратора"); return
     msg=await u.message.reply_text("⏳")
     ok,s,_=YandexCloudVM.get_status()
     e={"RUNNING":"🟢","STOPPED":"🔴","STARTING":"🟡","STOPPING":"🟡"}.get(s,"⚪") if ok else "❌"
     r=f"{e} Статус ВМ: <b>{s}</b>" if ok else f"❌ {s}"
     await msg.edit_text(r,parse_mode="HTML")
-    db.log_command("tg",u.effective_user.id,"статус",r,ok)
+    db.log_command("tg",uid,"статус",r,ok)
 
 @check_access
 async def info_handler(u,c):
+    uid=u.effective_user.id
+    if not user_can(uid,"vm_control"):
+        await u.message.reply_text("⛔ Управление ВМ только для администратора"); return
     msg=await u.message.reply_text("⏳")
     ok,info=YandexCloudVM.get_info()
     await msg.edit_text(info if ok else f"❌ {info}",parse_mode="HTML" if ok else None)
-    db.log_command("tg",u.effective_user.id,"информация","ОК" if ok else info,ok)
+    db.log_command("tg",uid,"информация","ОК" if ok else info,ok)
 
 @check_access
 async def start_vm(u,c):
+    uid=u.effective_user.id
+    if not user_can(uid,"vm_control"):
+        await u.message.reply_text("⛔ Управление ВМ только для администратора"); return
     msg=await u.message.reply_text("⏳ Запуск ВМ...")
     ok,m=YandexCloudVM.start(); await msg.edit_text(m)
-    db.log_command("tg",u.effective_user.id,"запуск ВМ",m,ok)
+    db.log_command("tg",uid,"запуск ВМ",m,ok)
 
 @check_access
 async def stop_vm(u,c):
+    uid=u.effective_user.id
+    if not user_can(uid,"vm_control"):
+        await u.message.reply_text("⛔ Управление ВМ только для администратора"); return
     msg=await u.message.reply_text("⏳ Остановка ВМ...")
     ok,m=YandexCloudVM.stop(); await msg.edit_text(m)
-    db.log_command("tg",u.effective_user.id,"остановка ВМ",m,ok)
+    db.log_command("tg",uid,"остановка ВМ",m,ok)
 
 @check_access
 async def restart_vm(u,c):
+    uid=u.effective_user.id
+    if not user_can(uid,"vm_control"):
+        await u.message.reply_text("⛔ Управление ВМ только для администратора"); return
     msg=await u.message.reply_text("⏳ Перезапуск ВМ...")
     ok,m=YandexCloudVM.restart(); await msg.edit_text(m)
-    db.log_command("tg",u.effective_user.id,"перезапуск ВМ",m,ok)
+    db.log_command("tg",uid,"перезапуск ВМ",m,ok)
 
 @check_access
 async def vk_menu(u,c):
@@ -919,61 +1192,65 @@ async def vk_stop(u,c):
     msg=await u.message.reply_text("⏳")
     ok,m=ctrl_svc(VK_SVC,"stop"); await msg.edit_text(m)
     db.log_command("tg",u.effective_user.id,"выключить VK",m,ok)
-    await u.message.reply_text("Статус:",reply_markup=kbd_vk())
 
 @check_access
 async def vk_refresh(u,c): await vk_menu(u,c)
 
 @check_access
 async def schedule_h(u,c):
-    t=(f"⏰ <b>Расписание</b>\n\n"
-       f"Автозапуск: {'🟢 Вкл' if schedule_config.auto_start_enabled else '🔴 Выкл'} ({schedule_config.start_time} МСК)\n"
-       f"Автоостановка: {'🟢 Вкл' if schedule_config.auto_stop_enabled else '🔴 Выкл'} ({schedule_config.stop_time} МСК)")
-    await u.message.reply_text(t,parse_mode="HTML",reply_markup=kbd_schedule())
+    if not user_can(u.effective_user.id,"vm_control"):
+        await u.message.reply_text("⛔ Расписание только для администратора"); return
+    s="🟢" if schedule_config.auto_start_enabled else "🔴"
+    p="🟢" if schedule_config.auto_stop_enabled  else "🔴"
+    await u.message.reply_text(
+        f"⏰ <b>Расписание ВМ</b>\n\n{s} Автозапуск: {'включён' if schedule_config.auto_start_enabled else 'выключен'} [{schedule_config.start_time}]\n{p} Автоостановка: {'включена' if schedule_config.auto_stop_enabled else 'выключена'} [{schedule_config.stop_time}]",
+        parse_mode="HTML",reply_markup=kbd_schedule())
 
 @check_access
 async def toggle_start(u,c):
     schedule_config.auto_start_enabled=not schedule_config.auto_start_enabled
     schedule_config.save(); update_cron()
-    s="включён" if schedule_config.auto_start_enabled else "выключен"
-    await u.message.reply_text(f"✅ Автозапуск {s}",reply_markup=kbd_schedule())
+    st="🟢 включён" if schedule_config.auto_start_enabled else "🔴 выключен"
+    await u.message.reply_text(f"Автозапуск {st}",reply_markup=kbd_schedule())
+    db.log_command("tg",u.effective_user.id,"автозапуск",st,True)
 
 @check_access
 async def toggle_stop(u,c):
     schedule_config.auto_stop_enabled=not schedule_config.auto_stop_enabled
     schedule_config.save(); update_cron()
-    s="включена" if schedule_config.auto_stop_enabled else "выключена"
-    await u.message.reply_text(f"✅ Автоостановка {s}",reply_markup=kbd_schedule())
+    st="🟢 включена" if schedule_config.auto_stop_enabled else "🔴 выключена"
+    await u.message.reply_text(f"Автоостановка {st}",reply_markup=kbd_schedule())
+    db.log_command("tg",u.effective_user.id,"автоостановка",st,True)
 
 @check_access
 async def set_start_begin(u,c):
-    await u.message.reply_text("🕐 Введите время запуска ЧЧ:ММ (МСК). /cancel для отмены",
-                               reply_markup=ReplyKeyboardRemove()); return SET_START_TIME
+    await u.message.reply_text(f"Текущее время запуска: {schedule_config.start_time}\nВведите новое (ЧЧ:ММ):",reply_markup=ReplyKeyboardRemove())
+    return SET_START_TIME
 
 @check_access
 async def set_start_end(u,c):
+    t=u.message.text.strip()
     try:
-        h,m=map(int,u.message.text.strip().split(":"))
-        if not(0<=h<=23 and 0<=m<=59): raise ValueError
-        schedule_config.start_time=f"{h:02d}:{m:02d}"; schedule_config.save(); update_cron()
-        await u.message.reply_text(f"✅ Время запуска: {schedule_config.start_time} МСК",reply_markup=kbd_main())
-        return ConversationHandler.END
-    except: await u.message.reply_text("❌ Формат: ЧЧ:ММ"); return SET_START_TIME
+        h,m=t.split(":"); assert 0<=int(h)<24 and 0<=int(m)<60
+        schedule_config.start_time=t; schedule_config.save(); update_cron()
+        await u.message.reply_text(f"✅ Время запуска: {t}",reply_markup=kbd_schedule())
+    except: await u.message.reply_text("❌ Формат ЧЧ:ММ",reply_markup=kbd_schedule())
+    return ConversationHandler.END
 
 @check_access
 async def set_stop_begin(u,c):
-    await u.message.reply_text("🕐 Введите время остановки ЧЧ:ММ (МСК). /cancel для отмены",
-                               reply_markup=ReplyKeyboardRemove()); return SET_STOP_TIME
+    await u.message.reply_text(f"Текущее время остановки: {schedule_config.stop_time}\nВведите новое (ЧЧ:ММ):",reply_markup=ReplyKeyboardRemove())
+    return SET_STOP_TIME
 
 @check_access
 async def set_stop_end(u,c):
+    t=u.message.text.strip()
     try:
-        h,m=map(int,u.message.text.strip().split(":"))
-        if not(0<=h<=23 and 0<=m<=59): raise ValueError
-        schedule_config.stop_time=f"{h:02d}:{m:02d}"; schedule_config.save(); update_cron()
-        await u.message.reply_text(f"✅ Время остановки: {schedule_config.stop_time} МСК",reply_markup=kbd_main())
-        return ConversationHandler.END
-    except: await u.message.reply_text("❌ Формат: ЧЧ:ММ"); return SET_STOP_TIME
+        h,m=t.split(":"); assert 0<=int(h)<24 and 0<=int(m)<60
+        schedule_config.stop_time=t; schedule_config.save(); update_cron()
+        await u.message.reply_text(f"✅ Время остановки: {t}",reply_markup=kbd_schedule())
+    except: await u.message.reply_text("❌ Формат ЧЧ:ММ",reply_markup=kbd_schedule())
+    return ConversationHandler.END
 
 @check_access
 async def history_menu(u,c):
@@ -981,426 +1258,672 @@ async def history_menu(u,c):
 
 @check_access
 async def history_show(u,c):
-    rows=db.get_history(15)
+    rows=db.get_history(10)
     if not rows: await u.message.reply_text("📭 История пуста",reply_markup=kbd_history()); return
-    lines=["📜 <b>Последние 15 команд:</b>\n"]
+    lines=["📜 <b>Последние 10 команд:</b>\n"]
     for r in rows:
-        lines.append(f"{'✅' if r['success'] else '❌'} <code>{r['timestamp']}</code>\n"
-                     f"   [{r['platform'].upper()}] uid:{r['user_id']} — {r['command']}\n"
-                     f"   ↳ {r['result'] or '—'}\n")
+        lines.append(f"{'✅' if r['success'] else '❌'} {r['timestamp']}\n  [{r['platform'].upper()}] {r['command']}\n  ↳ {r['result'] or '—'}")
     await u.message.reply_text("\n".join(lines),parse_mode="HTML",reply_markup=kbd_history())
 
 @check_access
 async def auto_events_show(u,c):
-    rows=db.get_auto_events(10)
-    if not rows: await u.message.reply_text("📭 Нет авто-событий",reply_markup=kbd_history()); return
+    rows=db.get_auto_events(8)
+    if not rows: await u.message.reply_text("📭 Нет событий",reply_markup=kbd_history()); return
     lines=["🤖 <b>Авто-события:</b>\n"]
     for r in rows:
-        lines.append(f"{'✅' if r['success'] else '❌'} <code>{r['timestamp']}</code> [{r['event_type']}]\n   {r['details']}\n")
+        lines.append(f"{'✅' if r['success'] else '❌'} {r['timestamp']} [{r['event_type']}]\n  {r['details']}")
     await u.message.reply_text("\n".join(lines),parse_mode="HTML",reply_markup=kbd_history())
 
 @check_access
 async def db_stats(u,c):
     s=db.get_stats()
     await u.message.reply_text(
-        f"📊 <b>Статистика БД</b>\n\n• Команд: {s['total']} (TG:{s['tg']} VK:{s['vk']})\n"
-        f"• Авто-событий: {s['auto']}\n• Срок хранения: {s['retention']} дн.\n"
-        f"• Старейшая: {s['oldest']}\n• Новейшая: {s['newest']}",
+        f"📊 <b>Статистика БД</b>\n\nКоманд: {s['total']} (TG:{s['tg']} VK:{s['vk']})\nАвто-событий: {s['auto']}\nСрок: {s['retention']} дн.\nСтарейшая: {s['oldest']}\nНовейшая: {s['newest']}",
         parse_mode="HTML",reply_markup=kbd_history())
 
 @check_access
 async def set_retention_begin(u,c):
     days=db.get_setting("retention_days",db.DEFAULT_RETENTION_DAYS)
-    await u.message.reply_text(
-        f"⏱ Текущий срок: <b>{days} дней</b>\n\nВведите новое значение (≥1).\n"
-        "⚠️ Записи старше лимита удалятся немедленно.\n\n/cancel для отмены",
-        parse_mode="HTML",reply_markup=ReplyKeyboardRemove()); return SET_RETENTION
+    await u.message.reply_text(f"⏱ Текущий срок хранения: {days} дней\nВведите новое значение (≥1):",reply_markup=ReplyKeyboardRemove())
+    return SET_RETENTION
 
 @check_access
 async def set_retention_end(u,c):
     try:
-        days=int(u.message.text.strip())
-        if days<1: raise ValueError
-        deleted=db.set_retention(days)
-        await u.message.reply_text(f"✅ Срок хранения: {days} дн. Удалено: {deleted} записей",reply_markup=kbd_main())
-        return ConversationHandler.END
-    except: await u.message.reply_text("❌ Введите целое число ≥ 1"); return SET_RETENTION
+        d=int(u.message.text.strip()); assert d>=1
+        deleted=db.set_retention(d)
+        await u.message.reply_text(f"✅ Срок: {d} дн. Удалено {deleted} записей.",reply_markup=kbd_history())
+    except: await u.message.reply_text("❌ Введите целое число ≥1",reply_markup=kbd_history())
+    return ConversationHandler.END
 
 @check_access
 async def clear_history(u,c):
-    deleted=db.clear_all_history()
-    await u.message.reply_text(f"🗑️ Очищено: {deleted} записей",reply_markup=kbd_history())
+    n=db.clear_all_history()
+    db.log_auto_event("manual_clear",f"Ручная очистка TG: {n} записей")
+    await u.message.reply_text(f"✅ Удалено {n} записей",reply_markup=kbd_history())
 
 @check_access
 async def settings_menu(u,c):
+    uid=u.effective_user.id
     mode="🔒 Скрыт" if get_sensitive() else "🔓 Виден"
-    await u.message.reply_text(f"⚙️ <b>Настройки</b>\n\n🔧 Инструменты: <b>{mode}</b>",parse_mode="HTML",reply_markup=kbd_settings())
+    await u.message.reply_text(f"⚙️ <b>Настройки</b>\n\n🔧 Инструменты: <b>{mode}</b>",
+                               parse_mode="HTML",reply_markup=kbd_settings(uid))
 
 @check_access
 async def toggle_sensitive(u,c):
+    uid=u.effective_user.id
     val=not get_sensitive(); set_sensitive(val)
     mode="скрыты 🔒" if val else "видны 🔓"
-    await u.message.reply_text(f"✅ Инструменты {mode}",reply_markup=kbd_settings())
+    await u.message.reply_text(f"✅ Инструменты {mode}",reply_markup=kbd_settings(uid))
     await u.message.reply_text("↩️ Меню:",reply_markup=kbd_main())
 
 @check_access
 async def delete_bot_begin(u,c):
     await u.message.reply_text("⚠️ <b>Удаление бота с сервера</b>\n\nВведите PIN:",
-                               parse_mode="HTML",reply_markup=ReplyKeyboardRemove()); return AWAIT_DELETE_PIN
+                               parse_mode="HTML",reply_markup=ReplyKeyboardRemove())
+    return AWAIT_DELETE_PIN
 
 @check_access
 async def delete_bot_pin(u,c):
-    if u.message.text.strip()!=config.admin_pin:
+    if u.message.text.strip()==config.admin_pin:
+        db.log_command("tg",u.effective_user.id,"удаление бота","выполнено",True)
+        await u.message.reply_text("🗑️ PIN верный. Удаление через 3 секунды...",reply_markup=ReplyKeyboardRemove())
+        async def _del():
+            await asyncio.sleep(3)
+            subprocess.Popen(["sudo","/opt/vm_manager/uninstall.sh"])
+        asyncio.create_task(_del())
+    else:
         db.log_command("tg",u.effective_user.id,"удаление бота","неверный PIN",False)
-        await u.message.reply_text("❌ Неверный PIN. Отменено.",reply_markup=kbd_main())
-        return ConversationHandler.END
-    await u.message.reply_text("🗑️ PIN верный. Удаление через 3 секунды...")
-    db.log_command("tg",u.effective_user.id,"удаление бота","выполнено",True)
-    async def _del():
-        await asyncio.sleep(3); subprocess.Popen(["sudo","/opt/vm_manager/uninstall.sh"])
-    asyncio.create_task(_del()); return ConversationHandler.END
-
-async def cancel_h(u,c):
-    await u.message.reply_text("❌ Отменено",reply_markup=kbd_main()); return ConversationHandler.END
+        await u.message.reply_text("❌ Неверный PIN. Отменено.",reply_markup=kbd_settings(u.effective_user.id))
+    return ConversationHandler.END
 
 @check_access
-async def back_main(u,c): await u.message.reply_text("Главное меню",reply_markup=kbd_main())
+async def cancel_h(u,c):
+    await u.message.reply_text("↩️ Отменено",reply_markup=kbd_main()); return ConversationHandler.END
+
+@check_access
+async def back_main(u,c):
+    await u.message.reply_text("Главное меню",reply_markup=kbd_main())
 
 @check_access
 async def tools_menu(u,c):
     await u.message.reply_text("🔧 <b>Инструменты</b>",parse_mode="HTML",reply_markup=kbd_tools())
 
+# ── YouTube: меню и обработчики ───────────────────────────────
 @check_access
-async def yt_tools_menu(u,c):
-    try:
-        import json as _j
-        ssh_ok=bool(_j.load(open(CONFIG_FILE)).get("ssh_vps",{}).get("host","") if (BASE_DIR/"config.json").exists() else "")
-    except: ssh_ok=False
-    ssh_info="🌍 Загрузка через ВМ Яндекс.Облака (быстрый канал)" if ssh_ok else "☁️ Прямая загрузка на Яндекс.Диск"
+async def yt_menu_show(u,c):
+    ssh_info="🌍 Загрузка через ВМ (быстрый канал)" if config.yadisk_ssh_key else "☁️ Прямая загрузка на Яндекс.Диск"
     await u.message.reply_text(
-        f"🎬 <b>YouTube</b>\n\n{ssh_info}\n\n"
-        "Просто отправь ссылку на видео — скачаю и пришлю.\n"
-        "Полный YouTube-интерфейс (поиск, подписки) — в VK боте.",
-        parse_mode="HTML", reply_markup=kbd_tools())
+        f"🎬 <b>YouTube</b>\n\n{ssh_info}\n\nОтправь ссылку напрямую — скачаю сразу.\nИли используй кнопки ниже:",
+        parse_mode="HTML",reply_markup=kbd_youtube())
 
-# ── 💻 КОНСОЛЬ ───────────────────────────────────────────────
+@check_access
+async def yt_inline(u,c):
+    """Автодетект YouTube ссылки — запрашиваем качество."""
+    url=u.message.text.strip(); uid=u.effective_user.id
+    msg=await u.message.reply_text("🔍 Получаю информацию о видео...",reply_markup=ReplyKeyboardRemove())
+    loop=asyncio.get_event_loop()
+    title,dubbed=await loop.run_in_executor(None,_yt_get_meta_sync,url)
+    c.user_data['yt_url']=url; c.user_data['yt_title']=title; c.user_data['yt_dubbed']=dubbed
+    if dubbed:
+        dub_list="\n".join([f"{i+1}. {d['label']}" for i,d in enumerate(dubbed)])
+        await msg.edit_text(
+            f"🎬 {title}\n\nДубляжи:\n{dub_list}\n{len(dubbed)+1}. Оригинал\n\n"
+            f"Качество: MAX) Максимум  A) 1080p  B) 720p  C) 480p  D) 360p\n\nПример: 1A (1080p) или {len(dubbed)+1}MAX (макс) или « Назад")
+        return TG_YT_DUB
+    await msg.edit_text(f"🎬 {title}\n\nВыбери качество:\nMAX) Максимум (лучшее)\nA) 1080p\nB) 720p\nC) 480p\nD) 360p\n(или « Назад)")
+    return TG_YT_QUAL
+
+async def _yt_dub_handler(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("↩️",reply_markup=kbd_main()); return ConversationHandler.END
+    m=re.match(r'^(\d+)([ABCabc]?)$',text)
+    if not m: await u.message.reply_text("❌ Формат: 1A или 2C"); return TG_YT_DUB
+    url=c.user_data.get('yt_url',''); title=c.user_data.get('yt_title',''); dubbed=c.user_data.get('yt_dubbed',[])
+    choice=int(m.group(1))-1; h={"A":"720","B":"480","C":"360"}.get(m.group(2).upper() or "A","720")
+    if choice==len(dubbed): fmt=f"bestvideo[height<={h}]+bestaudio/best"
+    elif 0<=choice<len(dubbed): fmt=f"bestvideo[height<={h}]+{dubbed[choice]['fid']}/bestvideo[height<={h}]+bestaudio/best"
+    else: await u.message.reply_text(f"❌ Неверный номер"); return TG_YT_DUB
+    await u.message.reply_text(f"⏳ Скачиваю «{title[:40]}» ({h}p)...\nБот доступен.",reply_markup=kbd_main())
+    asyncio.create_task(_tg_yt_download_and_send(c.bot,u.effective_user.id,url,title,fmt))
+    return ConversationHandler.END
+
+async def _yt_qual_handler(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("↩️",reply_markup=kbd_main()); return ConversationHandler.END
+    if not re.match(r'^(MAX|[ABCDabcd])$',text.upper()):
+        await u.message.reply_text("❌ MAX, A, B, C или D"); return TG_YT_QUAL
+    url=c.user_data.get('yt_url',''); title=c.user_data.get('yt_title','')
+    t=text.upper()
+    if t=="MAX":
+        fmt="bestvideo+bestaudio/best"; h_label="макс. качество"
+    else:
+        h={"A":"1080","B":"720","C":"480","D":"360"}.get(t,"720")
+        fmt=f"bestvideo[height<={h}]+bestaudio/bestvideo[height<={h}]+bestaudio/best"; h_label=f"{h}p"
+    await u.message.reply_text(f"⏳ Скачиваю «{title[:40]}» ({h_label})...\nБот доступен.",reply_markup=kbd_main())
+    asyncio.create_task(_tg_yt_download_and_send(c.bot,u.effective_user.id,url,title,fmt))
+    return ConversationHandler.END
+
+@check_access
+async def yt_search_begin(u,c):
+    await u.message.reply_text("🔍 Введи поисковый запрос:",reply_markup=kbd_back()); return TG_YT_SEARCH
+
+async def yt_search_end(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("🎬 YouTube",reply_markup=kbd_youtube()); return ConversationHandler.END
+    await u.message.reply_text("🔍 Ищу...")
+    loop=asyncio.get_event_loop()
+    results=await loop.run_in_executor(None,_yt_search_sync,text)
+    if not results:
+        await u.message.reply_text("❌ Ничего не найдено",reply_markup=kbd_youtube()); return ConversationHandler.END
+    lines=[f"🔍 <b>{text[:40]}</b>\n"]
+    for i,r in enumerate(results,1): lines.append(f"{i}. {r['title']}\n   ▶️ {r['channel']}\n   {r['url']}")
+    await u.message.reply_text("\n\n".join(lines)+"\n\nВведи номер:",parse_mode="HTML",reply_markup=kbd_back())
+    c.user_data['yt_search_results']=results; return TG_YT_SEARCH_PICK
+
+async def yt_search_pick(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("🎬 YouTube",reply_markup=kbd_youtube()); return ConversationHandler.END
+    try:
+        n=int(text)-1; results=c.user_data.get('yt_search_results',[])
+        if not 0<=n<len(results): await u.message.reply_text(f"❌ Номер 1-{len(results)}"); return TG_YT_SEARCH_PICK
+        v=results[n]; c.user_data['yt_url']=v['url']; c.user_data['yt_title']=v['title']; c.user_data['yt_dubbed']=[]
+        await u.message.reply_text(f"🎬 {v['title']}\n\nКачество:\nA) 720p\nB) 480p\nC) 360p")
+        return TG_YT_QUAL
+    except: await u.message.reply_text("❌ Введи число"); return TG_YT_SEARCH_PICK
+
+@check_access
+async def yt_channel_begin(u,c):
+    await u.message.reply_text("📺 Введи ссылку на канал или @username:",reply_markup=kbd_back()); return TG_YT_CHAN
+
+async def yt_channel_end(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("🎬 YouTube",reply_markup=kbd_youtube()); return ConversationHandler.END
+    await u.message.reply_text("⏳ Получаю видео...")
+    loop=asyncio.get_event_loop()
+    _,cname,videos=await loop.run_in_executor(None,_yt_channel_info_sync,text)
+    if not videos:
+        await u.message.reply_text("❌ Не удалось получить видео",reply_markup=kbd_youtube()); return ConversationHandler.END
+    lines=[f"📺 <b>{cname or text}</b>\n"]
+    for i,v in enumerate(videos,1): lines.append(f"{i}. {v['title']}\n   {v['url']}")
+    await u.message.reply_text("\n\n".join(lines)+"\n\nВведи номер:",parse_mode="HTML",reply_markup=kbd_back())
+    c.user_data['yt_chan_videos']=videos; return TG_YT_CHAN_PICK
+
+async def yt_channel_pick(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("🎬 YouTube",reply_markup=kbd_youtube()); return ConversationHandler.END
+    try:
+        n=int(text)-1; videos=c.user_data.get('yt_chan_videos',[])
+        if not 0<=n<len(videos): await u.message.reply_text(f"❌ Номер 1-{len(videos)}"); return TG_YT_CHAN_PICK
+        v=videos[n]; c.user_data['yt_url']=v['url']; c.user_data['yt_title']=v['title']; c.user_data['yt_dubbed']=[]
+        await u.message.reply_text(f"🎬 {v['title']}\n\nКачество:\nA) 720p\nB) 480p\nC) 360p")
+        return TG_YT_QUAL
+    except: await u.message.reply_text("❌ Введи число"); return TG_YT_CHAN_PICK
+
+@check_access
+async def yt_subscribe_begin(u,c):
+    await u.message.reply_text("➕ Введи ссылку на канал или @username:",reply_markup=kbd_back()); return TG_YT_SUB
+
+async def yt_subscribe_end(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("🎬 YouTube",reply_markup=kbd_youtube()); return ConversationHandler.END
+    text=_normalize_yt_channel_tg(text)
+    await u.message.reply_text("⏳ Получаю информацию о канале...")
+    uid=u.effective_user.id
+    loop=asyncio.get_event_loop()
+    cid,cname,videos=await loop.run_in_executor(None,_yt_channel_info_sync,text)
+    if not cid:
+        await u.message.reply_text("❌ Канал не найден",reply_markup=kbd_youtube()); return ConversationHandler.END
+    data=load_yt_subs()
+    if cid not in data["channels"]:
+        data["channels"][cid]={"name":cname,"url":text,"subscribers":[],
+                                "last_video_id":videos[0]["id"] if videos else "","last_check":""}
+    ch=data["channels"][cid]
+    if uid not in ch["subscribers"]:
+        ch["subscribers"].append(uid); save_yt_subs(data)
+        await u.message.reply_text(f"✅ Подписался на <b>{cname}</b>!\n\nПоследнее: {videos[0]['title'] if videos else 'нет'}",parse_mode="HTML",reply_markup=kbd_youtube())
+    else:
+        await u.message.reply_text(f"ℹ️ Уже подписан на <b>{cname}</b>",parse_mode="HTML",reply_markup=kbd_youtube())
+    return ConversationHandler.END
+
+@check_access
+async def yt_unsubscribe_begin(u,c):
+    uid=u.effective_user.id; data=load_yt_subs()
+    my_subs=[(cid,ch) for cid,ch in data["channels"].items() if uid in ch.get("subscribers",[])]
+    if not my_subs:
+        await u.message.reply_text("📭 Нет подписок",reply_markup=kbd_youtube()); return ConversationHandler.END
+    lines=["📺 <b>Твои подписки:</b>\n"]
+    for i,(cid,ch) in enumerate(my_subs,1): lines.append(f"{i}. {ch.get('name',cid)}")
+    await u.message.reply_text("\n".join(lines)+"\n\nВведи номер:",parse_mode="HTML",reply_markup=kbd_back())
+    c.user_data['yt_my_subs']=my_subs; return TG_YT_UNSUB_PICK
+
+async def yt_unsubscribe_pick(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("🎬 YouTube",reply_markup=kbd_youtube()); return ConversationHandler.END
+    try:
+        n=int(text)-1; my_subs=c.user_data.get('yt_my_subs',[]); uid=u.effective_user.id
+        if not 0<=n<len(my_subs): await u.message.reply_text(f"❌ Номер 1-{len(my_subs)}"); return TG_YT_UNSUB_PICK
+        cid,ch=my_subs[n]; data=load_yt_subs()
+        if cid in data["channels"]:
+            ch2=data["channels"][cid]
+            if uid in ch2["subscribers"]: ch2["subscribers"].remove(uid)
+            if not ch2["subscribers"]: del data["channels"][cid]
+            save_yt_subs(data)
+        await u.message.reply_text(f"✅ Отписался от <b>{ch.get('name',cid)}</b>",parse_mode="HTML",reply_markup=kbd_youtube())
+        return ConversationHandler.END
+    except: await u.message.reply_text("❌ Введи число"); return TG_YT_UNSUB_PICK
+
+# ── Администрирование ─────────────────────────────────────────
+@admin_only
+async def tg_admin_menu(u,c):
+    await u.message.reply_text("👮 <b>Администрирование</b>",parse_mode="HTML",reply_markup=kbd_admin())
+
+@admin_only
+async def tg_admin_add_begin(u,c):
+    await u.message.reply_text("➕ Введи TG User ID или @username\n(ID точнее — узнать через @userinfobot):",reply_markup=kbd_back())
+    return TG_ADMIN_ADD
+
+async def tg_admin_add_mid(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("👮 Администрирование",reply_markup=kbd_admin()); return ConversationHandler.END
+    uid_str=text.lstrip('@')
+    try:
+        new_uid=int(uid_str)
+        if new_uid in get_all_users():
+            await u.message.reply_text(f"ℹ️ ID {new_uid} уже в списке",reply_markup=kbd_admin()); return ConversationHandler.END
+        c.user_data['admin_add_uid']=new_uid; c.user_data['admin_add_label']=text
+        await u.message.reply_text(f"Добавить ID {new_uid}?\nВведи PIN для подтверждения:")
+        return TG_ADMIN_ADD_PIN
+    except:
+        await u.message.reply_text("❌ Введи числовой ID (@userinfobot поможет узнать)"); return TG_ADMIN_ADD
+
+async def tg_admin_add_pin(u,c):
+    if u.message.text.strip()==config.admin_pin:
+        new_uid=c.user_data.get('admin_add_uid'); label=c.user_data.get('admin_add_label',str(new_uid))
+        data=load_admin()
+        if new_uid not in data["extra_users"]: data["extra_users"].append(new_uid)
+        data["user_labels"][str(new_uid)]=label; save_admin(data)
+        db.log_command("tg",u.effective_user.id,f"add_user {new_uid}",label,True)
+        await u.message.reply_text(f"✅ ID {new_uid} добавлен в вайтлист!\nМожет использовать YouTube.",reply_markup=kbd_admin())
+    else:
+        await u.message.reply_text("❌ Неверный PIN",reply_markup=kbd_admin())
+    return ConversationHandler.END
+
+@admin_only
+async def tg_admin_remove_begin(u,c):
+    data=load_admin(); extra=data.get("extra_users",[]); labels=data.get("user_labels",{})
+    if not extra:
+        await u.message.reply_text("📭 Вайтлист пуст",reply_markup=kbd_admin()); return ConversationHandler.END
+    lines=["➖ <b>Вайтлист:</b>\n"]
+    for uid2 in extra: lines.append(f"• {labels.get(str(uid2),str(uid2))} — ID {uid2}")
+    await u.message.reply_text("\n".join(lines)+"\n\nВведи ID для удаления:",parse_mode="HTML",reply_markup=kbd_back())
+    return TG_ADMIN_REMOVE
+
+async def tg_admin_remove_mid(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("👮 Администрирование",reply_markup=kbd_admin()); return ConversationHandler.END
+    try:
+        rem_uid=int(text); data=load_admin()
+        if rem_uid not in [int(x) for x in data.get("extra_users",[])]:
+            await u.message.reply_text("❌ ID не найден в вайтлисте"); return TG_ADMIN_REMOVE
+        label=data.get("user_labels",{}).get(str(rem_uid),str(rem_uid))
+        c.user_data['admin_rem_uid']=rem_uid; c.user_data['admin_rem_label']=label
+        await u.message.reply_text(f"Удалить {label} (ID {rem_uid})? Введи PIN:")
+        return TG_ADMIN_REMOVE_PIN
+    except: await u.message.reply_text("❌ Числовой ID"); return TG_ADMIN_REMOVE
+
+async def tg_admin_remove_pin(u,c):
+    if u.message.text.strip()==config.admin_pin:
+        rem_uid=c.user_data.get('admin_rem_uid'); label=c.user_data.get('admin_rem_label')
+        data=load_admin()
+        data["extra_users"]=[x for x in data["extra_users"] if int(x)!=rem_uid]
+        data["user_labels"].pop(str(rem_uid),None); data["disabled_features"].pop(str(rem_uid),None)
+        save_admin(data)
+        db.log_command("tg",u.effective_user.id,f"remove_user {rem_uid}",label,True)
+        await u.message.reply_text(f"✅ {label} (ID {rem_uid}) удалён",reply_markup=kbd_admin())
+    else:
+        await u.message.reply_text("❌ Неверный PIN",reply_markup=kbd_admin())
+    return ConversationHandler.END
+
+@admin_only
+async def tg_admin_features_begin(u,c):
+    data=load_admin(); gd=data.get("global_disabled",[])
+    await u.message.reply_text(
+        f"🔧 <b>Управление функциями</b>\n\n"
+        f"Формат: &lt;ID&gt; &lt;функция&gt; вкл/выкл\nили: глобально &lt;функция&gt; вкл/выкл\n\n"
+        f"Функции: youtube, vm_control, terminal, tunnel, xui, vkpanel\n\n"
+        f"Сейчас глобально отключено: {', '.join(gd) or 'ничего'}\n\n"
+        f"Примеры:\n123456 youtube выкл\nглобально vm_control выкл",
+        parse_mode="HTML",reply_markup=kbd_back())
+    return TG_ADMIN_FEATURES
+
+async def tg_admin_features_end(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("👮 Администрирование",reply_markup=kbd_admin()); return ConversationHandler.END
+    parts=text.lower().split()
+    if len(parts)!=3:
+        await u.message.reply_text("❌ Формат: <ID/глобально> <функция> вкл/выкл"); return TG_ADMIN_FEATURES
+    target,feature,action=parts
+    if feature not in ("youtube","vm_control","terminal","tunnel","xui","vkpanel"):
+        await u.message.reply_text("❌ Неизвестная функция"); return TG_ADMIN_FEATURES
+    data=load_admin()
+    if target=="глобально":
+        gd=data.setdefault("global_disabled",[])
+        if action in ("выкл","off"):
+            if feature not in gd: gd.append(feature)
+            await u.message.reply_text(f"✅ {feature} глобально отключена",reply_markup=kbd_admin())
+        else:
+            if feature in gd: gd.remove(feature)
+            await u.message.reply_text(f"✅ {feature} глобально включена",reply_markup=kbd_admin())
+    else:
+        try: t_uid=int(target)
+        except: await u.message.reply_text("❌ Неверный ID"); return TG_ADMIN_FEATURES
+        ud=data.setdefault("disabled_features",{}).setdefault(str(t_uid),[])
+        if action in ("выкл","off"):
+            if feature not in ud: ud.append(feature)
+        else:
+            if feature in ud: ud.remove(feature)
+        await u.message.reply_text(f"✅ {feature} {'отключена' if action in ('выкл','off') else 'включена'} для ID {t_uid}",reply_markup=kbd_admin())
+    save_admin(data)
+    return ConversationHandler.END
+
+@admin_only
+async def tg_admin_broadcast_begin(u,c):
+    await u.message.reply_text("📢 Введи текст рассылки:",reply_markup=kbd_back()); return TG_ADMIN_BROADCAST
+
+async def tg_admin_broadcast_end(u,c):
+    text=u.message.text.strip()
+    if text=="« Назад":
+        await u.message.reply_text("👮 Администрирование",reply_markup=kbd_admin()); return ConversationHandler.END
+    users=get_all_users(); uid=u.effective_user.id; sent=0
+    for user_id in users:
+        if user_id==uid: continue
+        try: await c.bot.send_message(user_id,f"📢 Сообщение от администратора:\n\n{text}"); sent+=1
+        except: pass
+    await u.message.reply_text(f"✅ Рассылка отправлена {sent} пользователям",reply_markup=kbd_admin())
+    return ConversationHandler.END
+
+@admin_only
+async def tg_admin_list(u,c):
+    data=load_admin(); labels=data.get("user_labels",{}); gd=data.get("global_disabled",[])
+    lines=["📋 <b>Пользователи:</b>\n","👑 Администраторы (конфиг):"]
+    for uid2 in config.allowed_users: lines.append(f"  • ID {uid2} (все права)")
+    lines.append("\n🔓 Вайтлист:")
+    extra=data.get("extra_users",[])
+    if not extra: lines.append("  (пусто)")
+    for uid2 in extra:
+        dis=data.get("disabled_features",{}).get(str(uid2),[])
+        tag=f" [блок: {','.join(dis)}]" if dis else ""
+        lines.append(f"  • {labels.get(str(uid2),str(uid2))} — ID {uid2}{tag}")
+    lines.append(f"\n🚫 Глобально отключено: {', '.join(gd) or 'ничего'}")
+    await u.message.reply_text("\n".join(lines),parse_mode="HTML",reply_markup=kbd_admin())
+
+# ── 💻 Консоль ───────────────────────────────────────────────
 @check_access
 async def console_menu(u,c):
-    await u.message.reply_text(
-        "💻 <b>Консоль</b>\n\nВведите команду (неинтерактивную).\n"
-        "⏱ Таймаут: 30с | ✂️ Лимит вывода: 4000 символов\n\n/cancel для выхода",
-        parse_mode="HTML", reply_markup=kbd_console())
-    return CONSOLE_INPUT
+    if not user_can(u.effective_user.id,"terminal"):
+        await u.message.reply_text("⛔ Терминал только для администратора"); return ConversationHandler.END
+    await u.message.reply_text("💻 <b>Консоль</b>\nВведите команду. Таймаут: 30с\n/cancel для выхода",
+        parse_mode="HTML",reply_markup=kbd_console()); return CONSOLE_INPUT
 
 @check_access
 async def console_exec(u,c):
     cmd=u.message.text.strip()
     if cmd=="« Назад":
-        await u.message.reply_text("Главное меню",reply_markup=kbd_main())
-        return ConversationHandler.END
-    msg=await u.message.reply_text("⏳ Выполняю...")
+        await u.message.reply_text("↩️",reply_markup=kbd_tools()); return ConversationHandler.END
+    msg=await u.message.reply_text("⏳")
     ok,out=run_cmd(cmd,timeout=30)
-    result=out or "(нет вывода)"
-    disp=f"<code>$ {cmd[:150]}</code>\n\n<pre>{result}</pre>"
-    # Telegram limit 4096 per message
-    if len(disp)>4096: disp=disp[:4090]+"…</pre>"
-    await msg.edit_text(disp,parse_mode="HTML")
-    db.log_command("tg",u.effective_user.id,f"console: {cmd[:100]}",result[:200],ok)
-    await u.message.reply_text("Следующая команда или /cancel:",reply_markup=kbd_console())
+    await msg.edit_text(f"{'✅' if ok else '❌'} <code>$ {cmd[:100]}</code>\n\n<code>{out or '(нет вывода)'}</code>",
+                        parse_mode="HTML")
+    db.log_command("tg",u.effective_user.id,f"console: {cmd[:100]}",out[:200],ok)
     return CONSOLE_INPUT
 
-# ── 🔐 WIREGUARD ─────────────────────────────────────────────
+# ── WireGuard ─────────────────────────────────────────────────
 @check_access
 async def wg_menu(u,c):
+    if not user_can(u.effective_user.id,"tunnel"):
+        await u.message.reply_text("⛔ Туннель только для администратора"); return
     await u.message.reply_text("🔑 <b>Туннель</b>",parse_mode="HTML",reply_markup=kbd_wg())
 
 @check_access
 async def wg_listusers(u,c):
-    msg=await u.message.reply_text("⏳")
-    ok,out=run_cmd("wv listusers")
-    await msg.edit_text(f"👥 <b>Пользователи WG:</b>\n<pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_wg())
+    msg=await u.message.reply_text("⏳"); ok,out=run_cmd("wv listusers")
+    await msg.edit_text(f"👥 <b>Пиры:</b>\n<code>{out or '—'}</code>",parse_mode="HTML")
     db.log_command("tg",u.effective_user.id,"wg listusers",out[:100],ok)
 
 @check_access
 async def wg_adduser_begin(u,c):
-    await u.message.reply_text("➕ Введите имя нового пользователя:\n/cancel для отмены",
-                               reply_markup=ReplyKeyboardRemove())
-    return WG_ADDUSER_NAME
+    await u.message.reply_text("➕ Имя нового пира (без пробелов):",reply_markup=ReplyKeyboardRemove()); return WG_ADDUSER_NAME
 
 @check_access
 async def wg_adduser_end(u,c):
     name=u.message.text.strip()
     if not name or ' ' in name:
-        await u.message.reply_text("❌ Имя не должно быть пустым или содержать пробелы. Повторите:")
-        return WG_ADDUSER_NAME
+        await u.message.reply_text("❌ Имя без пробелов и пустое"); return WG_ADDUSER_NAME
     msg=await u.message.reply_text(f"⏳ Добавляю {name}…")
     ok,out=run_cmd(f"wv adduser {name}")
-    await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_wg())
+    await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}")
     db.log_command("tg",u.effective_user.id,f"wg adduser {name}",out[:100],ok)
-    return ConversationHandler.END
+    await u.message.reply_text("Туннель:",reply_markup=kbd_wg()); return ConversationHandler.END
 
 @check_access
 async def wg_getuser_begin(u,c):
-    await u.message.reply_text("📥 Введите имя пользователя для получения конфига:\n/cancel для отмены",
-                               reply_markup=ReplyKeyboardRemove())
-    return WG_GETUSER_NAME
+    await u.message.reply_text("📥 Имя пира для экспорта:",reply_markup=ReplyKeyboardRemove()); return WG_GETUSER_NAME
 
 @check_access
 async def wg_getuser_end(u,c):
-    name=u.message.text.strip()
-    msg=await u.message.reply_text(f"⏳ Получаю конфиг {name}…")
+    name=u.message.text.strip(); msg=await u.message.reply_text(f"⏳ Получаю {name}…")
     ok,out=run_cmd(f"wv getuser {name}")
     if not ok:
-        await msg.edit_text(f"❌ <pre>{out}</pre>",parse_mode="HTML",reply_markup=kbd_wg())
-        db.log_command("tg",u.effective_user.id,f"wg getuser {name}",out[:100],False)
-        return ConversationHandler.END
-    # Отправляем как .conf-файл и zip
+        await msg.edit_text(f"❌ {out}"); db.log_command("tg",u.effective_user.id,f"wg getuser {name}",out[:100],False)
+        await u.message.reply_text("Туннель:",reply_markup=kbd_wg()); return ConversationHandler.END
     try:
         import zipfile
-        conf_bytes=out.encode()
-        with tempfile.NamedTemporaryFile(suffix=f"_{name}.conf",delete=False,mode='wb') as cf:
-            cf.write(conf_bytes); conf_path=cf.name
-        zip_path=conf_path+".zip"
-        with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED) as zf:
-            zf.write(conf_path,f"{name}.conf")
-        await msg.delete()
-        await u.message.reply_document(document=open(conf_path,'rb'),filename=f"{name}.conf",
-                                       caption=f"🔑 Туннель конфиг: <b>{name}</b>",
-                                       parse_mode="HTML",reply_markup=kbd_wg())
-        await u.message.reply_document(document=open(zip_path,'rb'),filename=f"{name}.zip",
-                                       caption=f"📦 ZIP: {name}.conf")
-        os.unlink(conf_path); os.unlink(zip_path)
-        db.log_command("tg",u.effective_user.id,f"wg getuser {name}","отправлен .conf+.zip",True)
+        with tempfile.NamedTemporaryFile(delete=False,suffix=f"_{name}.conf") as cf:
+            cf.write(out.encode()); cpath=cf.name
+        await u.message.reply_document(document=open(cpath,"rb"),filename=f"{name}.conf")
+        os.unlink(cpath)
+        with tempfile.NamedTemporaryFile(delete=False,suffix=".zip") as zf_tmp: zpath=zf_tmp.name
+        with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as zf: zf.writestr(f"{name}.conf",out)
+        await u.message.reply_document(document=open(zpath,"rb"),filename=f"{name}.zip")
+        os.unlink(zpath)
+        await msg.edit_text(f"✅ Конфиг {name} отправлен (.conf + .zip)")
+        db.log_command("tg",u.effective_user.id,f"wg getuser {name}","sent",True)
     except Exception as e:
-        await u.message.reply_text(f"❌ Ошибка отправки файла: {e}",reply_markup=kbd_wg())
-    return ConversationHandler.END
+        await msg.edit_text(f"❌ {e}")
+    await u.message.reply_text("Туннель:",reply_markup=kbd_wg()); return ConversationHandler.END
 
 @check_access
 async def wg_deluser_begin(u,c):
-    await u.message.reply_text("🗑 Введите имя пользователя для удаления:\n/cancel для отмены",
-                               reply_markup=ReplyKeyboardRemove())
-    return WG_DELUSER_NAME
+    await u.message.reply_text("🗑 Имя пира для удаления:",reply_markup=ReplyKeyboardRemove()); return WG_DELUSER_NAME
 
 @check_access
 async def wg_deluser_name(u,c):
     c.user_data['wg_del_name']=u.message.text.strip()
-    await u.message.reply_text(
-        f"🔐 Удалить пользователя <b>{c.user_data['wg_del_name']}</b>?\nВведите PIN для подтверждения:",
-        parse_mode="HTML")
-    return WG_DELUSER_PIN
+    await u.message.reply_text(f"🔐 Удалить {c.user_data['wg_del_name']}? Введите PIN:"); return WG_DELUSER_PIN
 
 @check_access
 async def wg_deluser_pin(u,c):
     name=c.user_data.get('wg_del_name','?')
-    if u.message.text.strip()!=config.admin_pin:
+    if u.message.text.strip()==config.admin_pin:
+        msg=await u.message.reply_text(f"⏳ Удаляю {name}…")
+        ok,out=run_cmd(f"wv deluser {name}")
+        await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}")
+        db.log_command("tg",u.effective_user.id,f"wg deluser {name}",out[:100],ok)
+    else:
         db.log_command("tg",u.effective_user.id,f"wg deluser {name}","неверный PIN",False)
-        await u.message.reply_text("❌ Неверный PIN. Отменено.",reply_markup=kbd_wg())
-        return ConversationHandler.END
-    msg=await u.message.reply_text(f"⏳ Удаляю {name}…")
-    ok,out=run_cmd(f"wv deluser {name}")
-    await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_wg())
-    db.log_command("tg",u.effective_user.id,f"wg deluser {name}",out[:100],ok)
-    return ConversationHandler.END
+        await u.message.reply_text("❌ Неверный PIN")
+    await u.message.reply_text("Туннель:",reply_markup=kbd_wg()); return ConversationHandler.END
 
-# ── 📡 Медиасервер ───────────────────────────────────────────────
+# ── Медиасервер ───────────────────────────────────────────────
 @check_access
 async def vkpanel_menu(u,c):
+    if not user_can(u.effective_user.id,"vkpanel"):
+        await u.message.reply_text("⛔ Медиасервер только для администратора"); return
     await u.message.reply_text("📡 <b>Медиасервер</b>",parse_mode="HTML",reply_markup=kbd_vkpanel())
 
 @check_access
 async def vkpanel_start(u,c):
-    msg=await u.message.reply_text("⏳ Старт МС…")
-    ok,out=run_vkpanel(1)
-    await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_vkpanel())
-    db.log_command("tg",u.effective_user.id,"vkpanel start",out[:100],ok)
+    msg=await u.message.reply_text("⏳"); ok,out=run_vkpanel(1)
+    await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}"); db.log_command("tg",u.effective_user.id,"vkpanel start",out[:100],ok)
 
 @check_access
 async def vkpanel_restart(u,c):
-    msg=await u.message.reply_text("⏳ Рестарт МС…")
-    ok,out=run_vkpanel(3)
-    await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_vkpanel())
-    db.log_command("tg",u.effective_user.id,"vkpanel restart",out[:100],ok)
+    msg=await u.message.reply_text("⏳"); ok,out=run_vkpanel(3)
+    await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}"); db.log_command("tg",u.effective_user.id,"vkpanel restart",out[:100],ok)
 
 @check_access
 async def vkpanel_status(u,c):
-    ok,out=run_cmd("systemctl status whitelist-bypass 2>&1 | head -25 || "
-                   "pgrep -fa vk-panel 2>&1 || echo 'Сервис не найден'")
-    await u.message.reply_text(f"📊 <b>Статус МС:</b>\n<pre>{out}</pre>",
-                               parse_mode="HTML",reply_markup=kbd_vkpanel())
-    db.log_command("tg",u.effective_user.id,"vkpanel status",out[:100],ok)
+    msg=await u.message.reply_text("⏳"); ok,out=run_vkpanel(4)
+    await msg.edit_text(f"📊 МС:\n{out or '—'}"); db.log_command("tg",u.effective_user.id,"vkpanel status",out[:100],ok)
 
 @check_access
 async def vkpanel_logs(u,c):
-    msg=await u.message.reply_text("⏳ Получаю логи…")
-    ok,out=run_vkpanel(16)
-    await msg.edit_text(f"📋 <b>Логи МС:</b>\n<pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_vkpanel())
+    msg=await u.message.reply_text("⏳"); ok,out=run_vkpanel(5)
+    await msg.edit_text(f"📋 Логи МС:\n<code>{out or '—'}</code>",parse_mode="HTML")
     db.log_command("tg",u.effective_user.id,"vkpanel logs",out[:50],ok)
 
 @check_access
 async def vkpanel_qr(u,c):
-    msg=await u.message.reply_text("⏳ Генерирую QR…")
-    ok,out=run_vkpanel(13,timeout=25)
-    urls=re.findall(r'https?://\S+',out)
-    url=urls[0].rstrip(')') if urls else None
+    import re as _re
+    msg=await u.message.reply_text("⏳ QR…"); ok,out=run_vkpanel(13,timeout=25)
+    urls=_re.findall(r'https?://\S+',out); url=urls[0].rstrip(')') if urls else None
     if url:
         try:
             png=make_qr_bytes(url)
-            f=io.BytesIO(png); f.name="vkturn_qr.png"
+            await u.message.reply_photo(photo=io.BytesIO(png),caption=f"📱 МС\n{url}")
             await msg.delete()
-            await u.message.reply_document(document=f,filename="vkturn_qr.png",
-                                           caption=f"📱 QR МС\n<code>{url}</code>",
-                                           parse_mode="HTML",reply_markup=kbd_vkpanel())
             db.log_command("tg",u.effective_user.id,"vkpanel qr",f"url={url[:80]}",True)
-        except Exception as e:
-            await msg.edit_text(f"❌ Ошибка генерации QR: {e}",reply_markup=kbd_vkpanel())
-    else:
-        await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                            parse_mode="HTML",reply_markup=kbd_vkpanel())
-        db.log_command("tg",u.effective_user.id,"vkpanel qr","url не найден",False)
+        except Exception as e: await msg.edit_text(f"❌ {e}")
+    else: await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}")
 
 @check_access
 async def vkpanel_stop_begin(u,c):
-    await u.message.reply_text("🔐 Введите PIN для остановки МС:",
-                               reply_markup=ReplyKeyboardRemove())
-    return VKPANEL_STOP_PIN
+    await u.message.reply_text("🔐 PIN для остановки МС:",reply_markup=ReplyKeyboardRemove()); return VKPANEL_STOP_PIN
 
 @check_access
 async def vkpanel_stop_pin(u,c):
-    if u.message.text.strip()!=config.admin_pin:
+    if u.message.text.strip()==config.admin_pin:
+        msg=await u.message.reply_text("⏳ Остановка МС…"); ok,out=run_vkpanel(2)
+        await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}"); db.log_command("tg",u.effective_user.id,"vkpanel stop",out[:100],ok)
+    else:
         db.log_command("tg",u.effective_user.id,"vkpanel stop","неверный PIN",False)
-        await u.message.reply_text("❌ Неверный PIN. Отменено.",reply_markup=kbd_vkpanel())
-        return ConversationHandler.END
-    msg=await u.message.reply_text("⏳ Остановка МС…")
-    ok,out=run_vkpanel(2)
-    await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_vkpanel())
-    db.log_command("tg",u.effective_user.id,"vkpanel stop",out[:100],ok)
-    return ConversationHandler.END
+        await u.message.reply_text("❌ Неверный PIN")
+    await u.message.reply_text("Медиасервер:",reply_markup=kbd_vkpanel()); return ConversationHandler.END
 
-# ── 🛡 X-UI ──────────────────────────────────────────────────
+# ── X-UI ─────────────────────────────────────────────────────
 @check_access
 async def xui_menu(u,c):
+    if not user_can(u.effective_user.id,"xui"):
+        await u.message.reply_text("⛔ Ядро только для администратора"); return
     await u.message.reply_text("⚙️ <b>Ядро</b>",parse_mode="HTML",reply_markup=kbd_xui())
 
 @check_access
 async def xui_status(u,c):
-    msg=await u.message.reply_text("⏳")
-    ok,out=run_xui(15)
-    await msg.edit_text(f"📊 <b>Статус ядра:</b>\n<pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_xui())
+    msg=await u.message.reply_text("⏳"); ok,out=run_xui(15)
+    await msg.edit_text(f"📊 Ядро:\n<code>{out or '—'}</code>",parse_mode="HTML")
     db.log_command("tg",u.effective_user.id,"xui status",out[:100],ok)
 
 @check_access
 async def xui_restart(u,c):
-    msg=await u.message.reply_text("⏳ Рестарт ядра…")
-    ok,out=run_xui(13)
-    await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_xui())
-    db.log_command("tg",u.effective_user.id,"xui restart",out[:100],ok)
+    msg=await u.message.reply_text("⏳ Рестарт…"); ok,out=run_xui(13)
+    await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}"); db.log_command("tg",u.effective_user.id,"xui restart",out[:100],ok)
 
 @check_access
 async def xui_logs(u,c):
-    msg=await u.message.reply_text("⏳ Получаю логи…")
-    ok,out=run_xui(16)
-    await msg.edit_text(f"📋 <b>Логи ядра:</b>\n<pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_xui())
+    msg=await u.message.reply_text("⏳"); ok,out=run_xui(16)
+    await msg.edit_text(f"📋 Логи ядра:\n<code>{out or '—'}</code>",parse_mode="HTML")
     db.log_command("tg",u.effective_user.id,"xui logs",out[:50],ok)
 
 @check_access
 async def xui_settings(u,c):
-    msg=await u.message.reply_text("⏳")
-    ok,out=run_xui(10)
-    await msg.edit_text(f"⚙️ <b>Настройки ядра:</b>\n<pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_xui())
+    msg=await u.message.reply_text("⏳"); ok,out=run_xui(10)
+    await msg.edit_text(f"⚙️ Настройки ядра:\n<code>{out or '—'}</code>",parse_mode="HTML")
     db.log_command("tg",u.effective_user.id,"xui settings",out[:100],ok)
 
 @check_access
 async def xui_stop_begin(u,c):
-    await u.message.reply_text("🔐 PIN для остановки ядра:",reply_markup=ReplyKeyboardRemove())
-    return XUI_STOP_PIN
+    await u.message.reply_text("🔐 PIN для остановки ядра:",reply_markup=ReplyKeyboardRemove()); return XUI_STOP_PIN
 
 @check_access
 async def xui_stop_pin(u,c):
-    if u.message.text.strip()!=config.admin_pin:
+    if u.message.text.strip()==config.admin_pin:
+        msg=await u.message.reply_text("⏳ Остановка ядра…"); ok,out=run_xui(12)
+        await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}"); db.log_command("tg",u.effective_user.id,"xui stop",out[:100],ok)
+    else:
         db.log_command("tg",u.effective_user.id,"xui stop","неверный PIN",False)
-        await u.message.reply_text("❌ Неверный PIN.",reply_markup=kbd_xui())
-        return ConversationHandler.END
-    msg=await u.message.reply_text("⏳ Остановка ядра…")
-    ok,out=run_xui(12)
-    await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_xui())
-    db.log_command("tg",u.effective_user.id,"xui stop",out[:100],ok)
-    return ConversationHandler.END
+        await u.message.reply_text("❌ Неверный PIN")
+    await u.message.reply_text("Ядро:",reply_markup=kbd_xui()); return ConversationHandler.END
 
 @check_access
 async def xui_port_begin(u,c):
-    await u.message.reply_text("🔐 PIN для смены порта:",reply_markup=ReplyKeyboardRemove())
-    return XUI_PORT_PIN
+    await u.message.reply_text("🔐 PIN для смены порта:",reply_markup=ReplyKeyboardRemove()); return XUI_PORT_PIN
 
 @check_access
 async def xui_port_pin(u,c):
-    if u.message.text.strip()!=config.admin_pin:
-        db.log_command("tg",u.effective_user.id,"xui port","неверный PIN",False)
-        await u.message.reply_text("❌ Неверный PIN.",reply_markup=kbd_xui())
-        return ConversationHandler.END
-    await u.message.reply_text("🔌 Введите новый порт (1–65535):")
-    return XUI_PORT_INPUT
+    if u.message.text.strip()==config.admin_pin:
+        await u.message.reply_text("🔌 Новый порт (1–65535):"); return XUI_PORT_INPUT
+    db.log_command("tg",u.effective_user.id,"xui port","неверный PIN",False)
+    await u.message.reply_text("❌ Неверный PIN",reply_markup=kbd_xui()); return ConversationHandler.END
 
 @check_access
 async def xui_port_input(u,c):
     try:
-        port=int(u.message.text.strip())
-        if not(1<=port<=65535): raise ValueError
-    except ValueError:
-        await u.message.reply_text("❌ Неверный порт (1–65535):")
-        return XUI_PORT_INPUT
-    msg=await u.message.reply_text(f"⏳ Меняю порт ядра на {port}…")
+        port=int(u.message.text.strip()); assert 1<=port<=65535
+    except:
+        await u.message.reply_text("❌ Неверный порт (1–65535):"); return XUI_PORT_INPUT
+    msg=await u.message.reply_text(f"⏳ Меняю порт на {port}…")
     try:
-        r=subprocess.run(f'printf "9\\n{port}\\n" | x-ui',shell=True,
-                        capture_output=True,text=True,timeout=20,
+        r=subprocess.run(f'printf "9\\n{port}\\n" | x-ui',shell=True,capture_output=True,text=True,timeout=20,
                         env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
         out=(r.stdout+r.stderr).strip()[:4000]; ok=r.returncode==0
     except Exception as e: ok=False; out=str(e)
-    await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_xui())
+    await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}")
     db.log_command("tg",u.effective_user.id,f"xui port {port}",out[:100],ok)
-    return ConversationHandler.END
+    await u.message.reply_text("Ядро:",reply_markup=kbd_xui()); return ConversationHandler.END
 
 @check_access
 async def xui_reset_begin(u,c):
-    await u.message.reply_text("⚠️ <b>Сброс настроек x-ui!</b>\n🔐 Введите PIN:",
-                               parse_mode="HTML",reply_markup=ReplyKeyboardRemove())
-    return XUI_RESET_PIN
+    await u.message.reply_text("🔐 PIN для сброса ядра:",reply_markup=ReplyKeyboardRemove()); return XUI_RESET_PIN
 
 @check_access
 async def xui_reset_pin(u,c):
-    if u.message.text.strip()!=config.admin_pin:
+    if u.message.text.strip()==config.admin_pin:
+        msg=await u.message.reply_text("⏳ Сброс ядра…"); ok,out=run_xui(8)
+        await msg.edit_text(f"{'✅' if ok else '❌'} {out or '—'}"); db.log_command("tg",u.effective_user.id,"xui reset",out[:100],ok)
+    else:
         db.log_command("tg",u.effective_user.id,"xui reset","неверный PIN",False)
-        await u.message.reply_text("❌ Неверный PIN.",reply_markup=kbd_xui())
-        return ConversationHandler.END
-    msg=await u.message.reply_text("⏳ Сброс ядра…")
-    ok,out=run_xui(8)
-    await msg.edit_text(f"{'✅' if ok else '❌'} <pre>{out or '—'}</pre>",
-                        parse_mode="HTML",reply_markup=kbd_xui())
-    db.log_command("tg",u.effective_user.id,"xui reset",out[:100],ok)
-    return ConversationHandler.END
+        await u.message.reply_text("❌ Неверный PIN")
+    await u.message.reply_text("Ядро:",reply_markup=kbd_xui()); return ConversationHandler.END
 
-# ── YouTube inline (автодетект ссылок) ───────────────────────
-YT_RE=re.compile(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+')
-
-@check_access
-async def yt_inline(u,c):
-    text=u.message.text.strip()
-    uid=u.effective_user.id
-    # Telegram автоматически встраивает YouTube через внутренний плеер
-    await u.message.reply_text(text,reply_markup=kbd_main())
-    db.log_command("tg",uid,f"yt {text[:80]}","embedded",True)
+# ── GitHub обновление ────────────────────────────────────────
+@admin_only
+async def tg_admin_github_update(u,c):
+    await u.message.reply_text(
+        "⏳ Запускаю обновление с GitHub...\n\nБот перезапустится автоматически. Подожди ~30 секунд.",
+        reply_markup=kbd_admin())
+    async def _do_update():
+        try:
+            loop=asyncio.get_event_loop()
+            r=await loop.run_in_executor(None,lambda: subprocess.run(
+                ["bash","/root/yabot_installer.sh","--github-force"],
+                capture_output=True,text=True,timeout=120,
+                env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"}))
+            logger.info(f"github update: rc={r.returncode} {(r.stdout+r.stderr)[-200:]}")
+        except Exception as e:
+            logger.error(f"github update error: {e}")
+    asyncio.create_task(_do_update())
 
 # ── Cron ─────────────────────────────────────────────────────
 def update_cron():
@@ -1426,73 +1949,96 @@ def main():
     if not config.vm_id: print("❌ Нет VM ID"); return
     update_cron()
     app=Application.builder().token(config.bot_token).build()
-    app.add_handler(CommandHandler("start",start_command))
+    H=app.add_handler
 
-    # ── Существующие ConversationHandlers ──
-    app.add_handler(ConversationHandler(
+    # ConversationHandlers
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🕐 Время запуска$"),set_start_begin)],
         states={SET_START_TIME:[MessageHandler(filters.TEXT&~filters.COMMAND,set_start_end)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🕐 Время остановки$"),set_stop_begin)],
         states={SET_STOP_TIME:[MessageHandler(filters.TEXT&~filters.COMMAND,set_stop_end)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^⏱ Срок:"),set_retention_begin)],
         states={SET_RETENTION:[MessageHandler(filters.TEXT&~filters.COMMAND,set_retention_end)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🗑️ Удалить бота с сервера$"),delete_bot_begin)],
         states={AWAIT_DELETE_PIN:[MessageHandler(filters.TEXT&~filters.COMMAND,delete_bot_pin)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-
-    # ── 💻 Терминал ──
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💻 Терминал$"),console_menu)],
         states={CONSOLE_INPUT:[MessageHandler(filters.TEXT&~filters.COMMAND,console_exec)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-
-    # ── 🔑 Туннель ──
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Новый пир$"),wg_adduser_begin)],
         states={WG_ADDUSER_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,wg_adduser_end)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📥 Экспорт$"),wg_getuser_begin)],
         states={WG_GETUSER_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,wg_getuser_end)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🗑 Удалить пир$"),wg_deluser_begin)],
         states={WG_DELUSER_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,wg_deluser_name)],
                 WG_DELUSER_PIN: [MessageHandler(filters.TEXT&~filters.COMMAND,wg_deluser_pin)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-
-    # ── 📡 Медиасервер ──
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^⏹ МС-стоп$"),vkpanel_stop_begin)],
         states={VKPANEL_STOP_PIN:[MessageHandler(filters.TEXT&~filters.COMMAND,vkpanel_stop_pin)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-
-    # ── ⚙️ Ядро ──
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^⏹ Ядро-стоп$"),xui_stop_begin)],
         states={XUI_STOP_PIN:[MessageHandler(filters.TEXT&~filters.COMMAND,xui_stop_pin)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔌 Ядро-порт$"),xui_port_begin)],
         states={XUI_PORT_PIN:  [MessageHandler(filters.TEXT&~filters.COMMAND,xui_port_pin)],
                 XUI_PORT_INPUT:[MessageHandler(filters.TEXT&~filters.COMMAND,xui_port_input)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
-    app.add_handler(ConversationHandler(
+    H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔃 Ядро-сброс$"),xui_reset_begin)],
         states={XUI_RESET_PIN:[MessageHandler(filters.TEXT&~filters.COMMAND,xui_reset_pin)]},
         fallbacks=[CommandHandler("cancel",cancel_h)]))
+    # YouTube inline (автодетект ссылок)
+    H(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+'),yt_inline)],
+        states={TG_YT_DUB: [MessageHandler(filters.TEXT&~filters.COMMAND,_yt_dub_handler)],
+                TG_YT_QUAL:[MessageHandler(filters.TEXT&~filters.COMMAND,_yt_qual_handler)]},
+        fallbacks=[CommandHandler("cancel",cancel_h)]))
+    # YouTube меню
+    H(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🎬 YouTube$"),yt_menu_show)],
+        states={
+            TG_YT_SEARCH:      [MessageHandler(filters.TEXT&~filters.COMMAND,yt_search_end)],
+            TG_YT_SEARCH_PICK: [MessageHandler(filters.TEXT&~filters.COMMAND,yt_search_pick)],
+            TG_YT_CHAN:        [MessageHandler(filters.TEXT&~filters.COMMAND,yt_channel_end)],
+            TG_YT_CHAN_PICK:   [MessageHandler(filters.TEXT&~filters.COMMAND,yt_channel_pick)],
+            TG_YT_DUB:        [MessageHandler(filters.TEXT&~filters.COMMAND,_yt_dub_handler)],
+            TG_YT_QUAL:       [MessageHandler(filters.TEXT&~filters.COMMAND,_yt_qual_handler)],
+            TG_YT_SUB:        [MessageHandler(filters.TEXT&~filters.COMMAND,yt_subscribe_end)],
+            TG_YT_UNSUB_PICK: [MessageHandler(filters.TEXT&~filters.COMMAND,yt_unsubscribe_pick)],
+        },
+        fallbacks=[CommandHandler("cancel",cancel_h),
+                   MessageHandler(filters.Regex("^« Назад$"),cancel_h)]))
+    # Администрирование
+    H(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^👮 Администрирование$"),tg_admin_menu)],
+        states={
+            TG_ADMIN_ADD:         [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_add_mid)],
+            TG_ADMIN_ADD_PIN:     [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_add_pin)],
+            TG_ADMIN_REMOVE:      [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_remove_mid)],
+            TG_ADMIN_REMOVE_PIN:  [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_remove_pin)],
+            TG_ADMIN_FEATURES:    [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_features_end)],
+            TG_ADMIN_BROADCAST:   [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_broadcast_end)],
+        },
+        fallbacks=[CommandHandler("cancel",cancel_h),
+                   MessageHandler(filters.Regex("^« Назад$"),cancel_h)]))
 
-    H=app.add_handler
-    # ── YouTube: автодетект ссылок ──
-    H(MessageHandler(filters.Regex(r'https?://((www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+'),yt_inline))
-    H(MessageHandler(filters.Regex("^🎬 YouTube$"),yt_tools_menu))
-    # ── Обычные обработчики ──
+    # Простые хэндлеры
+    H(CommandHandler("start",start_command))
     H(MessageHandler(filters.Regex("^📊 Статус$"),status_handler))
     H(MessageHandler(filters.Regex("^ℹ️ Информация$"),info_handler))
     H(MessageHandler(filters.Regex("^▶️ Запустить$"),start_vm))
@@ -1512,7 +2058,6 @@ def main():
     H(MessageHandler(filters.Regex("^🗑️ Очистить историю$"),clear_history))
     H(MessageHandler(filters.Regex("^⚙️ Настройки$"),settings_menu))
     H(MessageHandler(filters.Regex("^🔒 Скрыть инструменты$|^🔓 Показать инструменты$"),toggle_sensitive))
-    # ── Новые разделы ──
     H(MessageHandler(filters.Regex("^🔑 Туннель$"),wg_menu))
     H(MessageHandler(filters.Regex("^👥 Пиры$"),wg_listusers))
     H(MessageHandler(filters.Regex("^📡 Медиасервер$"),vkpanel_menu))
@@ -1528,7 +2073,21 @@ def main():
     H(MessageHandler(filters.Regex("^🔧 Ядро-настройки$"),xui_settings))
     H(MessageHandler(filters.Regex("^🔧 Инструменты$"),tools_menu))
     H(MessageHandler(filters.Regex("^« Назад$"),back_main))
-    logger.info("TG бот запущен v4.4"); print("✅ TG бот запущен!")
+    # YouTube меню — кнопки внутри меню (вне ConversationHandler)
+    H(MessageHandler(filters.Regex("^🔍 Поиск видео$"),yt_search_begin))
+    H(MessageHandler(filters.Regex("^▶️ Последние видео канала$"),yt_channel_begin))
+    H(MessageHandler(filters.Regex("^📺 Мои подписки$"),yt_unsubscribe_begin))
+    H(MessageHandler(filters.Regex("^➕ Подписаться на канал$"),yt_subscribe_begin))
+    H(MessageHandler(filters.Regex("^➖ Отписаться от канала$"),yt_unsubscribe_begin))
+    # Админ — кнопки
+    H(MessageHandler(filters.Regex("^➕ Добавить пользователя$"),tg_admin_add_begin))
+    H(MessageHandler(filters.Regex("^➖ Удалить пользователя$"),tg_admin_remove_begin))
+    H(MessageHandler(filters.Regex("^📋 Список пользователей$"),tg_admin_list))
+    H(MessageHandler(filters.Regex("^🔧 Функции пользователей$"),tg_admin_features_begin))
+    H(MessageHandler(filters.Regex("^📢 Рассылка$"),tg_admin_broadcast_begin))
+    H(MessageHandler(filters.Regex("^⬆️ Обновить с GitHub$"),tg_admin_github_update))
+
+    logger.info("TG бот запущен v5.0"); print("✅ TG бот v5.0 запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__=="__main__":
@@ -1667,12 +2226,26 @@ def load_yt_subs():
 def save_yt_subs(data):
     with open(YT_SUBS_FILE,"w") as f: json.dump(data,f,indent=2,ensure_ascii=False)
 
+
+def _normalize_yt_channel(text):
+    """Преобразует разные форматы ввода в YouTube URL."""
+    text = text.strip()
+    # VK-формат: "@id416991442 (@SatiAkura)" → берём username в скобках
+    m = re.search(r'\(@([A-Za-z0-9_]+)\)', text)
+    if m:
+        text = f"@{m.group(1)}"
+    # Просто @username → полный URL
+    if re.match(r'^@[A-Za-z0-9_]+$', text):
+        return f"https://www.youtube.com/{text}"
+    # Уже URL — оставляем
+    return text
+
 def yt_get_channel_info(channel_url):
     """Возвращает (channel_id, channel_name, latest_5_videos)"""
     try:
         import yt_dlp as yt
         opts={"quiet":True,"no_warnings":True,"extract_flat":"in_playlist",
-              "playlist_items":"1-5","noplaylist":False}
+              "playlist_items":"1-10","noplaylist":False}
         with yt.YoutubeDL(opts) as ydl:
             info=ydl.extract_info(channel_url,download=False)
         cid=info.get("channel_id") or info.get("id","")
@@ -1687,7 +2260,7 @@ def yt_get_channel_info(channel_url):
         logger.warning(f"yt_get_channel_info: {e}")
         return None,None,[]
 
-def yt_search(query,n=5):
+def yt_search(query,n=10):
     """Поиск YouTube. Возвращает список [{id,title,url,channel}]"""
     try:
         import yt_dlp as yt
@@ -1977,6 +2550,7 @@ def kbd_admin():
         [{"l":"📋 Список пользователей","c":"primary"}],
         [{"l":"🔧 Функции пользователей","c":"primary"}],
         [{"l":"📢 Рассылка","c":"primary"}],
+        [{"l":"⬆️ Обновить с GitHub","c":"primary"}],
         [{"l":"« Назад"}]])
 
 def kbd_console():
@@ -2345,12 +2919,12 @@ def handle(vk,uid,text):
             dub_list="\n".join([f"{i+1}. {d['label']}" for i,d in enumerate(dubbed)])
             send(vk,uid,
                 f"🎬 {title}\n\nДоступны дубляжи:\n{dub_list}\n{len(dubbed)+1}. Оригинал\n\n"
-                f"Качество:\nA) 720p  B) 480p  C) 360p\n\n"
-                f"Ответь, например: 1A (RU 720p) или {len(dubbed)+1}C (оригинал 360p)")
+                f"Качество:\nMAX) Максимум  A) 1080p  B) 720p  C) 480p  D) 360p\n\n"
+                f"Ответь, например: 1A (RU 1080p), {len(dubbed)+1}MAX (оригинал макс) или {len(dubbed)+1}D (360p)")
             states[uid]="yt_dub_choice"
             pending[uid]={"url":text,"dubbed":dubbed,"title":title,"prev_st":st}
         else:
-            send(vk,uid,f"🎬 {title}\n\nВыбери качество:\nA) 720p\nB) 480p\nC) 360p")
+            send(vk,uid,f"🎬 {title}\n\nВыбери качество:\nMAX) Максимум (лучшее доступное)\nA) 1080p\nB) 720p\nC) 480p\nD) 360p")
             states[uid]="yt_quality_choice"
             pending[uid]={"url":text,"title":title,"prev_st":st}
         return
@@ -2365,33 +2939,42 @@ def handle(vk,uid,text):
         if not url: send(vk,uid,"❌ Сессия истекла",kbd_main()); states[uid]="main"; return
         m=re.match(r'^(\d+)([ABCabc]?)$',text.strip())
         choice=int(m.group(1))-1; quality=(m.group(2).upper() or "A")
-        height={"A":"720","B":"480","C":"360"}.get(quality,"720")
+        if quality=="MAX":
+            height=None
+        else:
+            height={"A":"1080","B":"720","C":"480","D":"360"}.get(quality,"720")
         if choice==len(dubbed):
-            fmt=f"bestvideo[height<={height}]+bestaudio/bestvideo+bestaudio/best"
+            fmt=f"bestvideo[height<={height}]+bestaudio/bestvideo+bestaudio/best" if height else "bestvideo+bestaudio/best"
         elif 0<=choice<len(dubbed):
             fid=dubbed[choice]['fid']
-            fmt=f"bestvideo[height<={height}]+{fid}/bestvideo[height<={height}]+bestaudio/best"
+            fmt=(f"bestvideo[height<={height}]+{fid}/bestvideo[height<={height}]+bestaudio/best" if height
+                 else f"bestvideo+{fid}/bestvideo+bestaudio/best")
         else:
             pending[uid]=data; send(vk,uid,"❌ Неверный номер"); return
         prev_st=data.get("prev_st","main")
         states[uid]="main"
-        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height}p)...\nБот остаётся доступен.")
+        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height if height!='MAX' else 'макс. качество'})...\nБот остаётся доступен.")
         threading.Thread(target=_yt_download_and_send,args=(vk,uid,url,title,fmt,prev_st),daemon=True).start()
         return
 
     # ── Состояние: выбор качества ────────────────────────────────
     if st=="yt_quality_choice":
-        if not re.match(r'^[ABCabc]$',text.strip()):
+        t=text.strip().upper()
+        if not re.match(r'^(MAX|[ABCDabcd])$',t):
             pending.pop(uid,None); states[uid]=pending.get(uid,{}).get("prev_st","main")
             handle(vk,uid,text); return
         data=pending.pop(uid,{})
         url=data.get("url",""); title=data.get("title","YouTube")
         if not url: send(vk,uid,"❌ Сессия истекла",kbd_main()); states[uid]="main"; return
-        height={"A":"720","B":"480","C":"360"}.get(text.strip().upper(),"720")
-        fmt=f"bestvideo[height<={height}]+bestaudio/bestvideo[height<={height}]+bestaudio/best"
+        if t=="MAX":
+            fmt="bestvideo+bestaudio/best"
+            height="MAX"
+        else:
+            height={"A":"1080","B":"720","C":"480","D":"360"}.get(t,"720")
+            fmt=f"bestvideo[height<={height}]+bestaudio/bestvideo[height<={height}]+bestaudio/best"
         prev_st=data.get("prev_st","main")
         states[uid]="main"
-        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height}p)...\nБот остаётся доступен.")
+        send(vk,uid,f"⏳ Начинаю скачивание «{title}» ({height if height!='MAX' else 'макс. качество'})...\nБот остаётся доступен.")
         threading.Thread(target=_yt_download_and_send,args=(vk,uid,url,title,fmt,prev_st),daemon=True).start()
         return
 
@@ -2406,9 +2989,15 @@ def handle(vk,uid,text):
         lines=[f"🔍 Результаты поиска «{text[:40]}»:\n"]
         for i,r in enumerate(results,1):
             lines.append(f"{i}. {r['title']}\n   ▶️ {r['channel']}\n   {r['url']}")
-        send(vk,uid,"\n\n".join(lines)+"\n\nВведи номер для скачивания или « Назад:")
+        page=0; page_results=results[:5]
+        lines=[f"🔍 Результаты поиска «{text[:40]}» (1-5 из {len(results)}):\n"]
+        for i,r in enumerate(page_results,1):
+            lines.append(f"{i}. {r['title']}\n   ▶️ {r['channel']}\n   {r['url']}")
+        nav=""; 
+        if len(results)>5: nav="\n\n▶️ Ещё 5 — напиши 'ещё'"
+        send(vk,uid,"\n\n".join(lines)+f"\n\nВведи номер для скачивания или « Назад:{nav}")
         states[uid]="yt_search_results"
-        pending[uid]={"results":results,"query":text}
+        pending[uid]={"results":results,"query":text,"page":0}
         return
 
     if st=="yt_search_results":
@@ -2420,7 +3009,7 @@ def handle(vk,uid,text):
             if not 0<=n<len(results):
                 send(vk,uid,"❌ Неверный номер (1-5)"); return
             v=results[n]; url=v["url"]; title=v["title"]
-            send(vk,uid,f"🎬 {title}\n\nВыбери качество:\nA) 720p\nB) 480p\nC) 360p")
+            send(vk,uid,f"🎬 {title}\n\nВыбери качество:\nMAX) Максимум (лучшее доступное)\nA) 1080p\nB) 720p\nC) 480p\nD) 360p")
             states[uid]="yt_quality_choice"
             pending[uid]={"url":url,"title":title,"prev_st":"youtube"}
         except:
@@ -2431,15 +3020,18 @@ def handle(vk,uid,text):
     if st=="yt_channel_latest_input":
         if text=="« Назад":
             states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube()); return
+        text=_normalize_yt_channel(text)
         send(vk,uid,"⏳ Получаю последние видео...")
         cid,cname,videos=yt_get_channel_info(text)
         if not videos:
             send(vk,uid,"❌ Не удалось получить видео с канала",kbd_youtube())
             states[uid]="youtube"; return
-        lines=[f"📺 Последние видео канала {cname or text}:\n"]
+        lines=[f"📺 Последние видео ({len(videos)}) канала {cname or text}:\n"]
         for i,v in enumerate(videos,1):
             lines.append(f"{i}. {v['title']}\n   {v['url']}")
-        send(vk,uid,"\n\n".join(lines)+"\n\nВведи номер для скачивания:")
+        nav=""
+        if len(videos)>5: nav="\n(показано до 10 видео)"
+        send(vk,uid,"\n\n".join(lines)+f"\n\nВведи номер для скачивания:{nav}")
         states[uid]="yt_channel_latest_pick"
         pending[uid]={"videos":videos,"cname":cname}
         return
@@ -2453,7 +3045,7 @@ def handle(vk,uid,text):
             if not 0<=n<len(videos):
                 send(vk,uid,f"❌ Неверный номер (1-{len(videos)})"); return
             v=videos[n]; url=v["url"]; title=v["title"]
-            send(vk,uid,f"🎬 {title}\n\nВыбери качество:\nA) 720p\nB) 480p\nC) 360p")
+            send(vk,uid,f"🎬 {title}\n\nВыбери качество:\nMAX) Максимум (лучшее доступное)\nA) 1080p\nB) 720p\nC) 480p\nD) 360p")
             states[uid]="yt_quality_choice"
             pending[uid]={"url":url,"title":title,"prev_st":"youtube"}
         except:
@@ -2464,6 +3056,7 @@ def handle(vk,uid,text):
     if st=="yt_subscribe_input":
         if text=="« Назад":
             states[uid]="youtube"; send(vk,uid,"🎬 YouTube:",kbd_youtube()); return
+        text=_normalize_yt_channel(text)
         send(vk,uid,"⏳ Получаю информацию о канале...")
         cid,cname,videos=yt_get_channel_info(text)
         if not cid:
@@ -2823,7 +3416,17 @@ def handle(vk,uid,text):
         elif text=="⏰ Расписание":
             if not user_can(uid,"vm_control"):
                 send(vk,uid,"⛔ Расписание доступно только администратору",kbd_main()); return
-            send(vk,uid,"⏰ Расписание:",kbd_main())
+            try:
+                sc=json.load(open(BASE_DIR/"schedule.json")) if (BASE_DIR/"schedule.json").exists() else {}
+            except: sc={}
+            s="🟢" if sc.get("auto_start_enabled") else "🔴"
+            p="🟢" if sc.get("auto_stop_enabled") else "🔴"
+            st_time=sc.get("start_time","09:00"); sp_time=sc.get("stop_time","22:00")
+            send(vk,uid,
+                f"⏰ Расписание ВМ\n\n"
+                f"{s} Автозапуск: {'включён' if sc.get('auto_start_enabled') else 'выключен'} [{st_time}]\n"
+                f"{p} Автоостановка: {'включена' if sc.get('auto_stop_enabled') else 'выключена'} [{sp_time}]\n\n"
+                f"Управление расписанием — в Telegram боте.",kbd_main())
         else: send(vk,uid,"❓ Используйте кнопки.",kbd_main())
 
     elif st=="tools":
@@ -3059,6 +3662,18 @@ def handle(vk,uid,text):
         elif text=="📢 Рассылка":
             states[uid]="admin_broadcast"
             send(vk,uid,"📢 Введи текст рассылки (получат все пользователи из вайтлиста):")
+        elif text=="⬆️ Обновить с GitHub":
+            send(vk,uid,"⏳ Запускаю обновление с GitHub...\n\nБот перезапустится автоматически. Подожди ~30 секунд.",kbd_admin())
+            def _do_github_update():
+                try:
+                    r=subprocess.run(
+                        ["bash","/root/yabot_installer.sh","--github-force"],
+                        capture_output=True,text=True,timeout=120,
+                        env={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin"})
+                    logger.info(f"github update: rc={r.returncode} {(r.stdout+r.stderr)[-200:]}")
+                except Exception as e:
+                    logger.error(f"github update error: {e}")
+            threading.Thread(target=_do_github_update,daemon=True).start()
         elif text=="« Назад":
             states[uid]="settings"; send(vk,uid,"⚙️ Настройки:",kbd_settings(uid))
         else: send(vk,uid,"❓",kbd_admin())
@@ -3303,6 +3918,14 @@ update_config() {
         NVK_GRP="${NVK_GRP#-}"  # убираем минус если вставили из API
         read -p "VK пользователи [$CUR_VK_USR]: " NVK_USR; NVK_USR=${NVK_USR:-$CUR_VK_USR}
         read -p "Yandex OAuth Token [Enter — не менять]: " NYADISK; NYADISK=${NYADISK:-$CUR_YADISK}
+        CUR_SSH_USER=$(jq -r '.vk.yadisk_ssh_user // "ubuntu"' "$SHARED_CONFIG")
+        CUR_SSH_KEY=$(jq -r '.vk.yadisk_ssh_key // ""' "$SHARED_CONFIG")
+        echo -e "${YELLOW}SSH загрузка на Яндекс.Диск через ВМ:${NC}"
+        read -p "SSH пользователь [$CUR_SSH_USER]: " NSSH_USER; NSSH_USER=${NSSH_USER:-$CUR_SSH_USER}
+        read -p "SSH ключ [$CUR_SSH_KEY]: " NSSH_KEY; NSSH_KEY=${NSSH_KEY:-$CUR_SSH_KEY}
+        if [ -n "$NSSH_KEY" ] && [ ! -f "$NSSH_KEY" ]; then
+            echo -e "${RED}⚠️  Файл ключа не найден: $NSSH_KEY${NC}"
+        fi
         echo ""
     fi
 
@@ -3328,7 +3951,7 @@ update_config() {
     VK_BLOCK='"vk":null'
     if is_installed vk; then
         VKU=$(echo "$NVK_USR"|tr ','  '\n'|sed 's/^[[:space:]]*//'|jq -R 'tonumber'|jq -s '.')
-        VK_BLOCK="\"vk\":{\"group_token\":\"$NVK_TOK\",\"group_id\":$NVK_GRP,\"allowed_users\":$VKU,\"user_token\":\"$NVK_UTOK\",\"yadisk_token\":\"$NYADISK\"}"
+        VK_BLOCK="\"vk\":{\"group_token\":\"$NVK_TOK\",\"group_id\":$NVK_GRP,\"allowed_users\":$VKU,\"user_token\":\"$NVK_UTOK\",\"yadisk_token\":\"$NYADISK\",\"yadisk_ssh_user\":\"$NSSH_USER\",\"yadisk_ssh_key\":\"$NSSH_KEY\"}"
     fi
 
     printf '{"installed":%s,"vm_id":"%s","folder_id":"%s","admin_pin":"%s",%s,%s}\n' \
@@ -3548,7 +4171,9 @@ for x in d.get('changelog',[]): print('  •',x)
     rm -f "$TMP_VER"
     echo -e "${YELLOW}Версия на GitHub:${NC}  v$NEW_VER"; echo ""
 
-    if [ "$CUR_VER" = "$NEW_VER" ] && [ "$FORCE" != "force" ]; then
+    if [ "${NON_INTERACTIVE:-}" = "1" ]; then
+        echo -e "${YELLOW}🔃 Принудительное обновление (non-interactive) v$CUR_VER → v$NEW_VER${NC}"; echo ""
+    elif [ "$CUR_VER" = "$NEW_VER" ] && [ "$FORCE" != "force" ]; then
         echo -e "${GREEN}✅ Уже последняя версия (v$CUR_VER)${NC}"
         echo ""
         read -p "Принудительно переустановить текущую версию? (y/n): " force_confirm
