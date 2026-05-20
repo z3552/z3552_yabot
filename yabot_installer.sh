@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v9.0
+# Автор: z3552[Reenpak]  |  yabot_installer v9.1
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -61,6 +61,23 @@ is_installed() {
 # ─────────────────────────────────────────────────────────────
 
 
+_update_bridge_config() {
+    # Добавляем только tg_bridge секцию, не трогая остальное
+    if [ ! -f "$SHARED_CONFIG" ]; then
+        echo -e "${RED}❌ Конфиг не найден. Сначала установи ботов (опция 1).${NC}"
+        return 1
+    fi
+    python3 - << PYSCRIPT
+import json
+with open("$SHARED_CONFIG") as f:
+    d = json.load(f)
+d["tg_bridge"] = {"api_id": "$BRIDGE_API_ID", "api_hash": "$BRIDGE_API_HASH"}
+with open("$SHARED_CONFIG", "w") as f:
+    json.dump(d, f, indent=2)
+print("✅ tg_bridge добавлен в конфиг")
+PYSCRIPT
+}
+
 install_tg_bridge() {
     print_header
     echo -e "${CYAN}📱 УСТАНОВКА TG МОСТА (Telethon)${NC}"; echo ""
@@ -74,21 +91,23 @@ install_tg_bridge() {
     echo -e "${GREEN}✅ bridge.py записан${NC}"
     echo ""
     echo -e "${YELLOW}🔐 Авторизация в Telegram (введи номер телефона и код)...${NC}"; echo ""
-    "$BRIDGE_DIR_PATH/venv/bin/python3" - << 'AUTHPY'
+    cat > /tmp/tg_bridge_auth.py << 'AUTHSCRIPT'
 import asyncio, json
-from pathlib import Path
 from telethon import TelegramClient
 with open("/opt/vm_manager/config.json") as f: d = json.load(f)
-b = d.get("tg_bridge",{})
+b = d.get("tg_bridge", {})
 async def auth():
-    c = TelegramClient("/opt/vm_manager/tg_bridge/session",int(b["api_id"]),b["api_hash"])
+    c = TelegramClient("/opt/vm_manager/tg_bridge/session", int(b["api_id"]), b["api_hash"])
     await c.start()
     me = await c.get_me()
     print(f"✅ Авторизован: {me.first_name} (@{me.username})")
     await c.disconnect()
 asyncio.run(auth())
-AUTHPY
-    [ $? -ne 0 ] && echo -e "${RED}❌ Авторизация не удалась${NC}" && read -p "Enter..." && return 1
+AUTHSCRIPT
+    "$BRIDGE_DIR_PATH/venv/bin/python3" /tmp/tg_bridge_auth.py
+    AUTH_RESULT=$?
+    rm -f /tmp/tg_bridge_auth.py
+    [ $AUTH_RESULT -ne 0 ] && echo -e "${RED}❌ Авторизация не удалась${NC}" && read -p "Enter..." && return 1
     cat > /etc/systemd/system/vm-bridge-tg.service << SVCEOF
 [Unit]
 Description=TG Bridge (Telethon)
@@ -147,7 +166,7 @@ main_menu() {
         1) install_bot ;; 2) uninstall_bot ;; 3) check_status ;;
         4) view_logs ;;   5) restart_bot ;;  6) setup_auto_power ;;
         7) update_config ;; 8) update_bot_scripts ;; 9) update_from_github ;;
-        10) get_user_inputs_bridge && create_shared_config && install_tg_bridge ;; 10) update_from_github force ;; 0) exit 0 ;;
+        10) get_user_inputs_bridge && _update_bridge_config && install_tg_bridge ;; 10) update_from_github force ;; 0) exit 0 ;;
         *) echo -e "${RED}Неверный выбор!${NC}"; sleep 2; main_menu ;;
     esac
 }
@@ -405,6 +424,8 @@ create_dirs() {
 }
 
 create_shared_config() {
+    # Бэкап существующего конфига
+    [ -f "$SHARED_CONFIG" ] && cp "$SHARED_CONFIG" "${SHARED_CONFIG}.bak"
     echo -e "${YELLOW}📝 Создание конфигурации...${NC}"
     if $INSTALL_TG && $INSTALL_VK; then INSTALLED_JSON='["tg","vk"]'
     elif $INSTALL_TG; then              INSTALLED_JSON='["tg"]'
@@ -4470,6 +4491,10 @@ setup_sudoers() {
 # ─────────────────────────────────────────────────────────────
 
 update_config() {
+    # Бэкап конфига перед изменениями
+    [ -f "$SHARED_CONFIG" ] && cp "$SHARED_CONFIG" "${SHARED_CONFIG}.bak" && \
+        echo -e "${YELLOW}💾 Бэкап: ${SHARED_CONFIG}.bak${NC}"
+
     print_header
     echo -e "${CYAN}⚙️  ОБНОВЛЕНИЕ КОНФИГУРАЦИИ${NC}"; echo ""
     [ ! -f "$SHARED_CONFIG" ] && echo -e "${RED}❌ Боты не установлены${NC}" && sleep 2 && main_menu && return
