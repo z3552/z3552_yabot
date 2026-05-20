@@ -1,6 +1,6 @@
 #!/bin/bash
 # Менеджер установки/удаления ботов для управления ВМ Яндекс.Облака
-# Автор: z3552[Reenpak]  |  yabot_installer v8.7
+# Автор: z3552[Reenpak]  |  yabot_installer v9.0
 # Платформы: Telegram / VK / оба (выбор при установке)
 
 set -e
@@ -60,6 +60,69 @@ is_installed() {
 # ГЛАВНОЕ МЕНЮ
 # ─────────────────────────────────────────────────────────────
 
+
+install_tg_bridge() {
+    print_header
+    echo -e "${CYAN}📱 УСТАНОВКА TG МОСТА (Telethon)${NC}"; echo ""
+    BRIDGE_DIR_PATH="/opt/vm_manager/tg_bridge"
+    mkdir -p "$BRIDGE_DIR_PATH"
+    echo -e "${YELLOW}📦 Устанавливаем Telethon + Pillow...${NC}"
+    python3 -m venv "$BRIDGE_DIR_PATH/venv"
+    "$BRIDGE_DIR_PATH/venv/bin/pip" install --quiet telethon Pillow requests
+    echo -e "${YELLOW}📝 Создаём bridge.py...${NC}"
+    python3 - << 'WRITEPY'
+import re
+with open("/root/yabot_installer.sh") as f: src = f.read()
+code = src.split("# BRIDGE_PY_START\n")[1].split("\n# BRIDGE_PY_END")[0]
+with open("/opt/vm_manager/tg_bridge/bridge.py","w") as f: f.write(code)
+print("✅ bridge.py записан")
+WRITEPY
+    echo ""
+    echo -e "${YELLOW}🔐 Авторизация в Telegram (введи номер телефона и код)...${NC}"; echo ""
+    "$BRIDGE_DIR_PATH/venv/bin/python3" - << 'AUTHPY'
+import asyncio, json
+from pathlib import Path
+from telethon import TelegramClient
+with open("/opt/vm_manager/config.json") as f: d = json.load(f)
+b = d.get("tg_bridge",{})
+async def auth():
+    c = TelegramClient("/opt/vm_manager/tg_bridge/session",int(b["api_id"]),b["api_hash"])
+    await c.start()
+    me = await c.get_me()
+    print(f"✅ Авторизован: {me.first_name} (@{me.username})")
+    await c.disconnect()
+asyncio.run(auth())
+AUTHPY
+    [ $? -ne 0 ] && echo -e "${RED}❌ Авторизация не удалась${NC}" && read -p "Enter..." && return 1
+    cat > /etc/systemd/system/vm-bridge-tg.service << SVCEOF
+[Unit]
+Description=TG Bridge (Telethon)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$BRIDGE_DIR_PATH
+ExecStart=$BRIDGE_DIR_PATH/venv/bin/python3 $BRIDGE_DIR_PATH/bridge.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    systemctl daemon-reload
+    systemctl enable vm-bridge-tg.service
+    systemctl start vm-bridge-tg.service
+    sleep 2
+    if systemctl is-active --quiet vm-bridge-tg.service; then
+        echo -e "${GREEN}✅ TG Мост запущен!${NC}"
+    else
+        echo -e "${RED}❌ Не запустился. Лог: journalctl -u vm-bridge-tg -n 20${NC}"
+    fi
+    echo ""; read -p "Enter..."
+}
+
 main_menu() {
     # Автоочистка stale cron если боты не установлены
     if [ ! -f "$SHARED_CONFIG" ]; then
@@ -88,7 +151,8 @@ main_menu() {
     case $choice in
         1) install_bot ;; 2) uninstall_bot ;; 3) check_status ;;
         4) view_logs ;;   5) restart_bot ;;  6) setup_auto_power ;;
-        7) update_config ;; 8) update_bot_scripts ;; 9) update_from_github ;; 10) update_from_github force ;; 0) exit 0 ;;
+        7) update_config ;; 8) update_bot_scripts ;; 9) update_from_github ;;
+        10) get_user_inputs_bridge && create_shared_config && install_tg_bridge ;; 10) update_from_github force ;; 0) exit 0 ;;
         *) echo -e "${RED}Неверный выбор!${NC}"; sleep 2; main_menu ;;
     esac
 }
@@ -308,6 +372,18 @@ get_user_inputs_vk() {
     echo -e "${GREEN}✅ Данные VK собраны${NC}"; echo ""
 }
 
+get_user_inputs_bridge() {
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║          📱 TG МОСТ (Telethon)                               ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"; echo ""
+    echo -e "${YELLOW}Получи api_id и api_hash: https://my.telegram.org → Apps${NC}"; echo ""
+    read -p "api_id (число): " BRIDGE_API_ID
+    [ -z "$BRIDGE_API_ID" ] && echo -e "${RED}❌ Обязательно${NC}" && return 1
+    read -p "api_hash: " BRIDGE_API_HASH
+    [ -z "$BRIDGE_API_HASH" ] && echo -e "${RED}❌ Обязательно${NC}" && return 1
+    echo -e "${GREEN}✅ Данные моста получены${NC}"; echo ""
+}
+
 get_admin_pin() {
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║          ADMIN PIN-КОД (удаление бота через чат)            ║${NC}"
@@ -354,8 +430,9 @@ create_shared_config() {
         VK_BLOCK='"vk":null'
     fi
 
-    printf '{"installed":%s,"vm_id":"%s","folder_id":"%s","admin_pin":"%s",%s,%s}\n' \
-        "$INSTALLED_JSON" "$VM_ID" "$FOLDER_ID" "$ADMIN_PIN" "$TG_BLOCK" "$VK_BLOCK" \
+    BRIDGE_BLOCK='"tg_bridge":{"api_id":"'${BRIDGE_API_ID:-}'"","api_hash":"'${BRIDGE_API_HASH:-}'"'}'
+    printf '{"installed":%s,"vm_id":"%s","folder_id":"%s","admin_pin":"%s",%s,%s,%s}\n' \
+        "$INSTALLED_JSON" "$VM_ID" "$FOLDER_ID" "$ADMIN_PIN" "$TG_BLOCK" "$VK_BLOCK" "$BRIDGE_BLOCK" \
         > "$SHARED_CONFIG"
     chmod 600 "$SHARED_CONFIG"
     echo -e "${GREEN}✅ Конфигурация создана (платформы: $INSTALLED_JSON)${NC}"; echo ""
@@ -631,7 +708,10 @@ def set_sensitive(val):
  TG_YT_DUB, TG_YT_QUAL, TG_YT_SEARCH, TG_YT_SEARCH_PICK,
  TG_YT_CHAN, TG_YT_CHAN_PICK, TG_YT_SUB, TG_YT_UNSUB_PICK,
  TG_ADMIN_ADD, TG_ADMIN_ADD_PIN, TG_ADMIN_REMOVE, TG_ADMIN_REMOVE_PIN,
- TG_ADMIN_FEATURES, TG_ADMIN_BROADCAST) = range(28)
+ TG_ADMIN_FEATURES, TG_ADMIN_BROADCAST, TG_ADMIN_MENU_STATE,
+ TG_SCHED_START, TG_SCHED_STOP,
+ TG_CHAN_BROWSE, TG_CHAN_PICK,
+ TG_CHAN_SUB_INPUT) = range(35)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO,
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()])
@@ -840,6 +920,7 @@ def kbd_youtube():
         [KeyboardButton("🔍 Поиск видео"),        KeyboardButton("▶️ Последние видео канала")],
         [KeyboardButton("📺 Мои подписки"),        KeyboardButton("➕ Подписаться на канал")],
         [KeyboardButton("➖ Отписаться от канала")],
+        [KeyboardButton("📡 TG Каналы")],
         [KeyboardButton("« Назад")],
     ],resize_keyboard=True)
 
@@ -957,15 +1038,20 @@ def _normalize_yt_channel_tg(text):
 def _yt_channel_info_sync(url):
     try:
         import yt_dlp as yt
+        # Добавляем /videos чтобы получить реальные видео, а не вкладки канала
+        u = url.rstrip('/')
+        if not any(x in u for x in ['/videos','/playlist','/shorts','/live','list=']):
+            u = u + '/videos'
         opts={"quiet":True,"no_warnings":True,"extract_flat":"in_playlist",
               "playlist_items":"1-10","noplaylist":False}
         with yt.YoutubeDL(opts) as ydl:
-            info=ydl.extract_info(url,download=False)
+            info=ydl.extract_info(u,download=False)
         cid=info.get("channel_id") or info.get("id","")
-        cname=info.get("channel") or info.get("title","")
+        cname=info.get("channel") or info.get("uploader") or info.get("title","")
         videos=[{"id":e.get("id",""),"title":e.get("title","")[:60],
-                 "url":e.get("url") or f"https://youtu.be/{e.get('id','')}"}
-                for e in (info.get("entries") or [])[:5] if e]
+                 "url":f"https://youtu.be/{e.get('id','')}"}
+                for e in (info.get("entries") or [])[:10]
+                if e and e.get("id") and not e.get("id","").startswith("UC")]
         return cid, cname, videos
     except Exception as e: logger.warning(f"yt_channel: {e}"); return None, None, []
 
@@ -1412,7 +1498,7 @@ async def yt_search_begin(u,c):
 
 async def yt_search_end(u,c):
     text=u.message.text.strip()
-    if text=="« Назад":
+    if text in ("« Назад","🎬 YouTube"):
         await u.message.reply_text("🎬 YouTube",reply_markup=kbd_youtube()); return ConversationHandler.END
     await u.message.reply_text("🔍 Ищу...")
     loop=asyncio.get_event_loop()
@@ -1426,7 +1512,7 @@ async def yt_search_end(u,c):
 
 async def yt_search_pick(u,c):
     text=u.message.text.strip()
-    if text=="« Назад":
+    if text in ("« Назад","🎬 YouTube"):
         await u.message.reply_text("🎬 YouTube",reply_markup=kbd_youtube()); return ConversationHandler.END
     try:
         n=int(text)-1; results=c.user_data.get('yt_search_results',[])
@@ -1525,8 +1611,8 @@ async def yt_unsubscribe_pick(u,c):
 @admin_only
 async def tg_admin_menu(u,c):
     await u.message.reply_text("👮 <b>Администрирование</b>",parse_mode="HTML",reply_markup=kbd_admin())
+    return TG_ADMIN_MENU_STATE
 
-@admin_only
 async def tg_admin_add_begin(u,c):
     await u.message.reply_text("➕ Введи TG User ID или @username\n(ID точнее — узнать через @userinfobot):",reply_markup=kbd_back())
     return TG_ADMIN_ADD
@@ -1556,13 +1642,12 @@ async def tg_admin_add_pin(u,c):
         await u.message.reply_text(f"✅ ID {new_uid} добавлен в вайтлист!\nМожет использовать YouTube.",reply_markup=kbd_admin())
     else:
         await u.message.reply_text("❌ Неверный PIN",reply_markup=kbd_admin())
-    return ConversationHandler.END
+    return TG_ADMIN_MENU_STATE
 
-@admin_only
 async def tg_admin_remove_begin(u,c):
     data=load_admin(); extra=data.get("extra_users",[]); labels=data.get("user_labels",{})
     if not extra:
-        await u.message.reply_text("📭 Вайтлист пуст",reply_markup=kbd_admin()); return ConversationHandler.END
+        await u.message.reply_text("📭 Вайтлист пуст",reply_markup=kbd_admin()); return TG_ADMIN_MENU_STATE
     lines=["➖ <b>Вайтлист:</b>\n"]
     for uid2 in extra: lines.append(f"• {labels.get(str(uid2),str(uid2))} — ID {uid2}")
     await u.message.reply_text("\n".join(lines)+"\n\nВведи ID для удаления:",parse_mode="HTML",reply_markup=kbd_back())
@@ -1593,9 +1678,8 @@ async def tg_admin_remove_pin(u,c):
         await u.message.reply_text(f"✅ {label} (ID {rem_uid}) удалён",reply_markup=kbd_admin())
     else:
         await u.message.reply_text("❌ Неверный PIN",reply_markup=kbd_admin())
-    return ConversationHandler.END
+    return TG_ADMIN_MENU_STATE
 
-@admin_only
 async def tg_admin_features_begin(u,c):
     data=load_admin(); gd=data.get("global_disabled",[])
     await u.message.reply_text(
@@ -1610,7 +1694,7 @@ async def tg_admin_features_begin(u,c):
 async def tg_admin_features_end(u,c):
     text=u.message.text.strip()
     if text=="« Назад":
-        await u.message.reply_text("👮 Администрирование",reply_markup=kbd_admin()); return ConversationHandler.END
+        await u.message.reply_text("👮 Администрирование",reply_markup=kbd_admin()); return TG_ADMIN_MENU_STATE
     parts=text.lower().split()
     if len(parts)!=3:
         await u.message.reply_text("❌ Формат: <ID/глобально> <функция> вкл/выкл"); return TG_ADMIN_FEATURES
@@ -1636,26 +1720,24 @@ async def tg_admin_features_end(u,c):
             if feature in ud: ud.remove(feature)
         await u.message.reply_text(f"✅ {feature} {'отключена' if action in ('выкл','off') else 'включена'} для ID {t_uid}",reply_markup=kbd_admin())
     save_admin(data)
-    return ConversationHandler.END
+    return TG_ADMIN_MENU_STATE
 
-@admin_only
 async def tg_admin_broadcast_begin(u,c):
     await u.message.reply_text("📢 Введи текст рассылки:",reply_markup=kbd_back()); return TG_ADMIN_BROADCAST
 
 async def tg_admin_broadcast_end(u,c):
     text=u.message.text.strip()
     if text=="« Назад":
-        await u.message.reply_text("👮 Администрирование",reply_markup=kbd_admin()); return ConversationHandler.END
+        await u.message.reply_text("👮 Администрирование",reply_markup=kbd_admin()); return TG_ADMIN_MENU_STATE
     users=get_all_users(); uid=u.effective_user.id; sent=0
     for user_id in users:
         if user_id==uid: continue
         try: await c.bot.send_message(user_id,f"📢 Сообщение от администратора:\n\n{text}"); sent+=1
         except: pass
     await u.message.reply_text(f"✅ Рассылка отправлена {sent} пользователям",reply_markup=kbd_admin())
-    return ConversationHandler.END
+    return TG_ADMIN_MENU_STATE
 
-@admin_only
-async def tg_admin_list(u,c):
+async def tg_admin_list_h(u,c):
     data=load_admin(); labels=data.get("user_labels",{}); gd=data.get("global_disabled",[])
     lines=["📋 <b>Пользователи:</b>\n","👑 Администраторы (конфиг):"]
     for uid2 in config.allowed_users: lines.append(f"  • ID {uid2} (все права)")
@@ -1668,6 +1750,7 @@ async def tg_admin_list(u,c):
         lines.append(f"  • {labels.get(str(uid2),str(uid2))} — ID {uid2}{tag}")
     lines.append(f"\n🚫 Глобально отключено: {', '.join(gd) or 'ничего'}")
     await u.message.reply_text("\n".join(lines),parse_mode="HTML",reply_markup=kbd_admin())
+    return TG_ADMIN_MENU_STATE
 
 # ── 💻 Консоль ───────────────────────────────────────────────
 @check_access
@@ -1907,6 +1990,182 @@ async def xui_reset_pin(u,c):
         await u.message.reply_text("❌ Неверный PIN")
     await u.message.reply_text("Ядро:",reply_markup=kbd_xui()); return ConversationHandler.END
 
+
+# ── TG Каналы (просмотр постов публичных каналов) ────────────
+TG_CHANNELS_FILE = BASE_DIR / "tg_channels.json"
+
+def load_tg_channels():
+    if TG_CHANNELS_FILE.exists():
+        try: return json.load(open(TG_CHANNELS_FILE))
+        except: pass
+    return {"channels":{}}
+
+def save_tg_channels(data):
+    with open(TG_CHANNELS_FILE,"w") as f: json.dump(data,f,indent=2,ensure_ascii=False)
+
+def _fetch_tg_channel_posts(slug, before_id=None, limit=8):
+    import requests as req
+    try:
+        url=f"https://t.me/s/{slug}"
+        if before_id: url+=f"?before={before_id}"
+        r=req.get(url,headers={"User-Agent":"Mozilla/5.0"},timeout=15)
+        if r.status_code!=200: return []
+        posts=[]
+        # Use double-quote only patterns to avoid heredoc issues
+        ids=re.findall(r"data-post=[^/]+/([0-9]+)[^0-9]",r.text)
+        raw_texts=re.findall(r"tgme_widget_message_text[^>]*>(.*?)</div>",r.text,re.DOTALL)
+        dates=re.findall(r"datetime=.([0-9T:+\-]{10,})",r.text)
+        has_video="video_thumb" in r.text or "tgme_widget_message_video" in r.text
+        def clean(s):
+            s=re.sub(r"<br\s*/?>","\n",s)
+            s=re.sub(r"<[^>]+>","",s)
+            for ent,ch in [("&amp;","&"),("&lt;","<"),("&gt;",">"),("&#39;","'"),("&quot;",'"')]:
+                s=s.replace(ent,ch)
+            return s.strip()
+        for i,pid in enumerate(ids[:limit]):
+            text=clean(raw_texts[i]) if i<len(raw_texts) else ""
+            date=dates[i][:10] if i<len(dates) else ""
+            preview=text[:80].replace("\n"," ")+("…" if len(text)>80 else "")
+            posts.append({"id":pid,"preview":preview or "(медиа)","text":text[:500],
+                          "date":date,"url":f"https://t.me/{slug}/{pid}",
+                          "has_video":has_video})
+        return posts
+    except Exception as e:
+        logger.warning(f"fetch_tg_posts {slug}: {e}"); return []
+
+
+def kbd_tg_channels():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("📋 Мои TG каналы"),   KeyboardButton("➕ Добавить TG канал")],
+        [KeyboardButton("➖ Удалить TG канал")],
+        [KeyboardButton("« Назад")],
+    ],resize_keyboard=True)
+
+@check_access
+async def tg_channels_menu(u,c):
+    data=load_tg_channels(); ch=data.get("channels",{})
+    lines=["📡 <b>TG Каналы</b>\n\nПросмотр постов публичных каналов.\n"]
+    if ch:
+        for slug,info in ch.items(): lines.append(f"• @{slug}")
+    await u.message.reply_text("\n".join(lines),parse_mode="HTML",reply_markup=kbd_tg_channels())
+
+@check_access
+async def tg_channels_list(u,c):
+    data=load_tg_channels(); channels=data.get("channels",{})
+    if not channels:
+        await u.message.reply_text("📭 Нет каналов\n\nДобавь через ➕",reply_markup=kbd_tg_channels()); return ConversationHandler.END
+    lines=["📋 <b>Выбери канал:</b>\n"]
+    items=list(channels.items())
+    for i,(slug,ch) in enumerate(items,1): lines.append(f"{i}. {ch.get('name','@'+slug)}")
+    await u.message.reply_text("\n".join(lines)+"\n\nВведи номер:",parse_mode="HTML",reply_markup=kbd_back())
+    c.user_data["tg_chan_list"]=items
+    return TG_CHAN_BROWSE
+
+@check_access
+async def tg_channels_add_begin(u,c):
+    await u.message.reply_text("➕ Введи @username канала (например @AEROCEtg):",reply_markup=kbd_back())
+    return TG_CHAN_SUB_INPUT
+
+async def tg_channels_add_end(u,c):
+    text=u.message.text.strip()
+    if text in ("« Назад","📡 TG Каналы"):
+        await u.message.reply_text("📡 TG Каналы",reply_markup=kbd_tg_channels()); return ConversationHandler.END
+    slug=text.lstrip("@").split("/")[-1].split("?")[0].strip()
+    await u.message.reply_text(f"⏳ Проверяю @{slug}...")
+    loop=asyncio.get_event_loop()
+    posts=await loop.run_in_executor(None,_fetch_tg_channel_posts,slug,None,3)
+    if not posts:
+        await u.message.reply_text(f"❌ @{slug} не найден или закрыт (только публичные каналы)",reply_markup=kbd_tg_channels())
+        return ConversationHandler.END
+    data=load_tg_channels()
+    data["channels"][slug]={"name":f"@{slug}","slug":slug}
+    save_tg_channels(data)
+    await u.message.reply_text(f"✅ @{slug} добавлен!\n\nПоследний: {posts[0]['preview']}",reply_markup=kbd_tg_channels())
+    return ConversationHandler.END
+
+@check_access
+async def tg_channels_remove(u,c):
+    data=load_tg_channels(); channels=data.get("channels",{})
+    if not channels:
+        await u.message.reply_text("📭 Нет каналов",reply_markup=kbd_tg_channels()); return ConversationHandler.END
+    slugs=list(channels.keys())
+    lines=["➖ <b>Удалить:</b>\n"]
+    for i,slug in enumerate(slugs,1): lines.append(f"{i}. @{slug}")
+    await u.message.reply_text("\n".join(lines)+"\n\nВведи номер:",parse_mode="HTML",reply_markup=kbd_back())
+    c.user_data["tg_chan_remove_list"]=slugs
+    return TG_CHAN_PICK
+
+async def tg_chan_browse_pick(u,c):
+    text=u.message.text.strip()
+    if text in ("« Назад","📡 TG Каналы"):
+        c.user_data.pop("tg_chan_list",None)
+        await u.message.reply_text("📡 TG Каналы",reply_markup=kbd_tg_channels()); return ConversationHandler.END
+    chan_list=c.user_data.get("tg_chan_list",[])
+    try:
+        n=int(text)-1
+        if not 0<=n<len(chan_list): await u.message.reply_text(f"❌ Номер 1-{len(chan_list)}"); return TG_CHAN_BROWSE
+        slug,ch=chan_list[n]
+        msg=await u.message.reply_text(f"⏳ Загружаю посты @{slug}...")
+        loop=asyncio.get_event_loop()
+        posts=await loop.run_in_executor(None,_fetch_tg_channel_posts,slug,None)
+        if not posts:
+            await msg.edit_text("❌ Посты не получены"); return TG_CHAN_BROWSE
+        lines=[f"📡 <b>@{slug}</b>:\n"]
+        for i,p in enumerate(posts,1):
+            vid="🎬 " if p.get("has_video") else ""
+            lines.append(f"{i}. {vid}{p['date']} — {p['preview']}\n   {p['url']}")
+        c.user_data["tg_cur_slug"]=slug; c.user_data[f"tg_posts"]=posts
+        c.user_data[f"tg_oldest_id"]=posts[-1]["id"]
+        await msg.edit_text("\n\n".join(lines)+"\n\n▶️ Номер поста · 'старше' · « Назад",
+                            parse_mode="HTML",disable_web_page_preview=True)
+        return TG_CHAN_PICK
+    except: await u.message.reply_text("❌ Введи число"); return TG_CHAN_BROWSE
+
+async def tg_chan_post_pick(u,c):
+    text=u.message.text.strip()
+    slug=c.user_data.get("tg_cur_slug","")
+    # Удаление
+    remove_list=c.user_data.get("tg_chan_remove_list")
+    if remove_list:
+        if text in ("« Назад","📡 TG Каналы"):
+            c.user_data.pop("tg_chan_remove_list",None)
+            await u.message.reply_text("📡 TG Каналы",reply_markup=kbd_tg_channels()); return ConversationHandler.END
+        try:
+            n=int(text)-1
+            if not 0<=n<len(remove_list): await u.message.reply_text(f"❌ Номер 1-{len(remove_list)}"); return TG_CHAN_PICK
+            sl=remove_list[n]; data=load_tg_channels(); data["channels"].pop(sl,None); save_tg_channels(data)
+            c.user_data.pop("tg_chan_remove_list",None)
+            await u.message.reply_text(f"✅ @{sl} удалён",reply_markup=kbd_tg_channels()); return ConversationHandler.END
+        except: await u.message.reply_text("❌ Введи число"); return TG_CHAN_PICK
+    if text in ("« Назад","📡 TG Каналы"):
+        await u.message.reply_text("📡 TG Каналы",reply_markup=kbd_tg_channels()); return ConversationHandler.END
+    posts=c.user_data.get("tg_posts",[])
+    if text.lower() in ("старше","older"):
+        oldest=c.user_data.get("tg_oldest_id")
+        msg=await u.message.reply_text("⏳ Загружаю старые посты...")
+        loop=asyncio.get_event_loop()
+        old_posts=await loop.run_in_executor(None,_fetch_tg_channel_posts,slug,oldest)
+        if not old_posts: await msg.edit_text("❌ Больше постов нет"); return TG_CHAN_PICK
+        lines=[f"📡 <b>@{slug}</b> (старые):\n"]
+        for i,p in enumerate(old_posts,1):
+            vid="🎬 " if p.get("has_video") else ""
+            lines.append(f"{i}. {vid}{p['date']} — {p['preview']}\n   {p['url']}")
+        c.user_data["tg_posts"]=old_posts; c.user_data["tg_oldest_id"]=old_posts[-1]["id"]
+        await msg.edit_text("\n\n".join(lines)+"\n\n▶️ Номер · 'старше' · « Назад",
+                            parse_mode="HTML",disable_web_page_preview=True)
+        return TG_CHAN_PICK
+    try:
+        n=int(text)-1
+        if not 0<=n<len(posts): await u.message.reply_text(f"❌ Номер 1-{len(posts)}"); return TG_CHAN_PICK
+        p=posts[n]; body=p.get("text","") or p["preview"]
+        vid_note="\n\n🎬 Есть видео — отправь ссылку боту для скачивания:" if p.get("has_video") else ""
+        await u.message.reply_text(
+            f"📄 @{slug}/{p['id']}  📅 {p['date']}\n\n{body}{vid_note}\n\n🔗 {p['url']}",
+            disable_web_page_preview=True,reply_markup=kbd_back())
+        return TG_CHAN_PICK
+    except: await u.message.reply_text("❌ Введи число"); return TG_CHAN_PICK
+
+
 # ── GitHub обновление ────────────────────────────────────────
 @admin_only
 async def tg_admin_github_update(u,c):
@@ -1924,6 +2183,7 @@ async def tg_admin_github_update(u,c):
         except Exception as e:
             logger.error(f"github update error: {e}")
     asyncio.create_task(_do_update())
+    return TG_ADMIN_MENU_STATE
 
 # ── Cron ─────────────────────────────────────────────────────
 def update_cron():
@@ -2027,12 +2287,37 @@ def main():
     H(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^👮 Администрирование$"),tg_admin_menu)],
         states={
-            TG_ADMIN_ADD:         [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_add_mid)],
-            TG_ADMIN_ADD_PIN:     [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_add_pin)],
-            TG_ADMIN_REMOVE:      [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_remove_mid)],
-            TG_ADMIN_REMOVE_PIN:  [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_remove_pin)],
-            TG_ADMIN_FEATURES:    [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_features_end)],
-            TG_ADMIN_BROADCAST:   [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_broadcast_end)],
+            TG_ADMIN_MENU_STATE:[
+                MessageHandler(filters.Regex("^➕ Добавить пользователя$"),tg_admin_add_begin),
+                MessageHandler(filters.Regex("^➖ Удалить пользователя$"),tg_admin_remove_begin),
+                MessageHandler(filters.Regex("^📋 Список пользователей$"),tg_admin_list_h),
+                MessageHandler(filters.Regex("^🔧 Функции пользователей$"),tg_admin_features_begin),
+                MessageHandler(filters.Regex("^📢 Рассылка$"),tg_admin_broadcast_begin),
+                MessageHandler(filters.Regex("^⬆️ Обновить с GitHub$"),tg_admin_github_update),
+                MessageHandler(filters.Regex("^« Назад$"),cancel_h),
+            ],
+            TG_ADMIN_ADD:        [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_add_mid)],
+            TG_ADMIN_ADD_PIN:    [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_add_pin)],
+            TG_ADMIN_REMOVE:     [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_remove_mid)],
+            TG_ADMIN_REMOVE_PIN: [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_remove_pin)],
+            TG_ADMIN_FEATURES:   [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_features_end)],
+            TG_ADMIN_BROADCAST:  [MessageHandler(filters.TEXT&~filters.COMMAND,tg_admin_broadcast_end)],
+        },
+        fallbacks=[CommandHandler("cancel",cancel_h)],
+        per_message=False))
+
+    # TG Каналы
+    H(ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^📡 TG Каналы$"),tg_channels_menu),
+            MessageHandler(filters.Regex("^📋 Мои TG каналы$"),tg_channels_list),
+            MessageHandler(filters.Regex("^➕ Добавить TG канал$"),tg_channels_add_begin),
+            MessageHandler(filters.Regex("^➖ Удалить TG канал$"),tg_channels_remove),
+        ],
+        states={
+            TG_CHAN_BROWSE:    [MessageHandler(filters.TEXT&~filters.COMMAND,tg_chan_browse_pick)],
+            TG_CHAN_PICK:      [MessageHandler(filters.TEXT&~filters.COMMAND,tg_chan_post_pick)],
+            TG_CHAN_SUB_INPUT: [MessageHandler(filters.TEXT&~filters.COMMAND,tg_channels_add_end)],
         },
         fallbacks=[CommandHandler("cancel",cancel_h),
                    MessageHandler(filters.Regex("^« Назад$"),cancel_h)]))
@@ -2080,12 +2365,6 @@ def main():
     H(MessageHandler(filters.Regex("^➕ Подписаться на канал$"),yt_subscribe_begin))
     H(MessageHandler(filters.Regex("^➖ Отписаться от канала$"),yt_unsubscribe_begin))
     # Админ — кнопки
-    H(MessageHandler(filters.Regex("^➕ Добавить пользователя$"),tg_admin_add_begin))
-    H(MessageHandler(filters.Regex("^➖ Удалить пользователя$"),tg_admin_remove_begin))
-    H(MessageHandler(filters.Regex("^📋 Список пользователей$"),tg_admin_list))
-    H(MessageHandler(filters.Regex("^🔧 Функции пользователей$"),tg_admin_features_begin))
-    H(MessageHandler(filters.Regex("^📢 Рассылка$"),tg_admin_broadcast_begin))
-    H(MessageHandler(filters.Regex("^⬆️ Обновить с GitHub$"),tg_admin_github_update))
 
     logger.info("TG бот запущен v5.0"); print("✅ TG бот v5.0 запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -2164,6 +2443,69 @@ def load_cfg():
             "ssh_port":int(ssh.get("port",22)),"ssh_key":ssh.get("key_path","")}
 
 cfg=load_cfg()
+# ── TG Мост: DB helpers ───────────────────────────────────────
+import sqlite3 as _sqlite3
+
+BRIDGE_DB = BASE_DIR / "tg_bridge" / "bridge_queue.db"
+
+def _bdb():
+    if not BRIDGE_DB.exists(): return None
+    c = _sqlite3.connect(str(BRIDGE_DB), timeout=5)
+    c.row_factory = _sqlite3.Row
+    return c
+
+def bridge_queue_cmd(cmd, chat_id=None, text=None, file_path=None,
+                     reply_to=None, fwd_chat=None, fwd_msg=None):
+    c = _bdb()
+    if not c: return False
+    try:
+        c.execute("INSERT INTO outgoing (cmd,chat_id,text,file_path,reply_to,fwd_chat,fwd_msg)"
+                  " VALUES (?,?,?,?,?,?,?)",
+                  (cmd, chat_id, text, file_path, reply_to, fwd_chat, fwd_msg))
+        c.commit(); c.close(); return True
+    except Exception as e:
+        logger.error(f"bridge_queue_cmd: {e}"); return False
+
+def bridge_get_known_chats():
+    c = _bdb()
+    if not c: return []
+    rows = list(c.execute("SELECT chat_id, chat_name, active FROM known_chats ORDER BY chat_name"))
+    c.close(); return rows
+
+def bridge_set_active(chat_id, active):
+    c = _bdb()
+    if not c: return
+    c.execute("UPDATE known_chats SET active=? WHERE chat_id=?", (1 if active else 0, chat_id))
+    c.commit(); c.close()
+
+def bridge_get_msg(ref):
+    c = _bdb()
+    if not c: return None
+    row = c.execute("SELECT tg_chat_id,tg_msg_id,sender,chat_name FROM msg_map WHERE ref=?",
+                    (ref,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+def bridge_get_history(chat_id, limit=100):
+    c = _bdb()
+    if not c: return []
+    rows = list(c.execute(
+        "SELECT ref,sender,chat_name,ts FROM msg_map WHERE tg_chat_id=? ORDER BY rowid DESC LIMIT ?",
+        (chat_id, limit)))
+    c.close(); return rows
+
+def bridge_is_running():
+    try:
+        r=subprocess.run(["systemctl","is-active","vm-bridge-tg"],capture_output=True,text=True)
+        return r.stdout.strip()=="active"
+    except: return False
+
+def _show_bridge_chats(vk, uid, chats):
+    send(vk, uid,
+         "\u0427\u0430\u0442\u044b TG (\u2705 = \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f, \u2b1c = \u0432\u044b\u043a\u043b):",
+         kbd_tg_bridge_chats(chats))
+
+
 states:dict[int,str]={}
 pending:dict[int,dict]={}
 vk_session_global=None
@@ -2289,7 +2631,7 @@ def _yt_check_subscriptions_thread():
             changed=False
             for cid,ch in data.get("channels",{}).items():
                 try:
-                    _,_,videos=yt_get_channel_info(ch.get("url",""))
+                    _,_,videos=yt_get_channel_info(ch.get("url","").rstrip('/')+'/videos' if not any(x in ch.get('url','') for x in ['/videos','/playlist','/shorts','/live','list=']) else ch.get('url',''))
                     if not videos: continue
                     latest_id=videos[0]["id"]
                     if latest_id and latest_id!=ch.get("last_video_id"):
@@ -2368,6 +2710,35 @@ def _yt_download_via_ssh(url,fmt,tmp_dir):
         return None,"⏱ Таймаут SSH-загрузки"
     except Exception as e:
         return None,str(e)
+
+def _show_schedule_vk(vk,uid):
+    try:
+        sc=json.load(open(BASE_DIR/"schedule.json")) if (BASE_DIR/"schedule.json").exists() else {}
+    except: sc={}
+    s="🟢" if sc.get("auto_start_enabled") else "🔴"
+    p="🟢" if sc.get("auto_stop_enabled") else "🔴"
+    send(vk,uid,
+        f"⏰ Расписание ВМ\n\n"
+        f"{s} Автозапуск: {'включён' if sc.get('auto_start_enabled') else 'выключен'} [{sc.get('start_time','09:00')}]\n"
+        f"{p} Автоостановка: {'включена' if sc.get('auto_stop_enabled') else 'выключена'} [{sc.get('stop_time','22:00')}]",
+        kbd_schedule_vk())
+
+def _toggle_schedule_vk(key):
+    path=BASE_DIR/"schedule.json"
+    try: sc=json.load(open(path)) if path.exists() else {}
+    except: sc={}
+    sc[key]=not sc.get(key,False)
+    for k,v in {"auto_start_enabled":False,"auto_stop_enabled":False,"start_time":"09:00","stop_time":"22:00"}.items():
+        sc.setdefault(k,v)
+    with open(path,"w") as f: json.dump(sc,f,indent=2)
+    return sc[key]
+
+def _set_schedule_time_vk(key,val):
+    path=BASE_DIR/"schedule.json"
+    try: sc=json.load(open(path)) if path.exists() else {}
+    except: sc={}
+    sc[key]=val
+    with open(path,"w") as f: json.dump(sc,f,indent=2)
 
 class VM:
     _ENV={**os.environ,"PATH":"/usr/local/bin:/usr/bin:/bin:/root/yandex-cloud/bin"}
@@ -2504,11 +2875,41 @@ def kbd_main():
     if not get_sensitive(): rows.append([{"l":"🔧 Инструменты","c":"primary"}])
     return _kbd(rows)
 
+def kbd_tg_bridge():
+    active=bridge_is_running()
+    st="🟢 Мост активен" if active else "🔴 Мост остановлен"
+    return _kbd([
+        [{"l":"💬 Чаты","c":"primary"},{"l":"✏️ Написать","c":"primary"}],
+        [{"l":"↩️ Ответить","c":"primary"},{"l":"↪️ Переслать","c":"primary"}],
+        [{"l":"📋 История чата","c":"primary"}],
+        [{"l":st,"c":"positive" if active else "negative"}],
+        [{"l":"« Назад"}]])
+
+def kbd_tg_bridge_chats(chats):
+    rows=[]
+    for cid,cname,act in chats:
+        emoji="✅" if act else "⬜"
+        rows.append([{"l":f"{emoji} {str(cname)[:25]}"}])
+    rows.append([{"l":"✅ Готово"},{"l":"« Назад"}])
+    return _kbd(rows)
+
+def kbd_schedule_vk():
+    try:
+        sc=json.load(open(BASE_DIR/"schedule.json")) if (BASE_DIR/"schedule.json").exists() else {}
+    except: sc={}
+    s="🟢" if sc.get("auto_start_enabled") else "🔴"
+    p="🟢" if sc.get("auto_stop_enabled") else "🔴"
+    return _kbd([
+        [{"l":f"{s} Автозапуск","c":"positive" if sc.get("auto_start_enabled") else "negative"},
+         {"l":f"{p} Автоостановка","c":"positive" if sc.get("auto_stop_enabled") else "negative"}],
+        [{"l":"🕐 Время запуска"},{"l":"🕐 Время остановки"}],
+        [{"l":"« Назад"}]])
+
 def kbd_tools(uid=None):
     rows=[
         [{"l":"💻 Терминал"},{"l":"🔑 Туннель","c":"primary"}],
         [{"l":"📡 Медиасервер"},{"l":"⚙️ Ядро","c":"primary"}],
-        [{"l":"🎬 YouTube","c":"positive"}],
+        [{"l":"🎬 YouTube","c":"positive"},{"l":"📱 TG Мост","c":"primary"}],
     ]
     if cfg.get("yadisk_token"): rows[2].append({"l":"📁 YaDisk видео","c":"primary"})
     rows.append([{"l":"« Назад"}])
@@ -3100,6 +3501,8 @@ def handle(vk,uid,text):
         if text=="« Назад":
             states[uid]="admin_menu"; send(vk,uid,"👮 Администрирование:",kbd_admin()); return
         if not is_admin(uid): send(vk,uid,"⛔ Только для администратора"); states[uid]="main"; return
+        _btns={"➕ Добавить пользователя","➖ Удалить пользователя","📋 Список пользователей","🔧 Функции пользователей","📢 Рассылка","⬆️ Обновить с GitHub","👮 Администрирование","⚙️ Настройки"}
+        if text in _btns: send(vk,uid,"✏️ Введи VK страницу (URL или @username):"); return
         send(vk,uid,"⏳ Ищу пользователя...")
         vk_api_obj=vk_session_global.get_api() if vk_session_global else vk
         new_uid,name=resolve_vk_user(vk_api_obj,text)
@@ -3235,6 +3638,45 @@ def handle(vk,uid,text):
             states[uid]="settings"; send(vk,uid,"❌ Неверный PIN. Отменено.",kbd_settings(uid))
         return
 
+    if st=="schedule_vk":
+        if text=="« Назад":
+            states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main()); return
+        if text in ("🟢 Автозапуск","🔴 Автозапуск"):
+            val=_toggle_schedule_vk("auto_start_enabled")
+            send(vk,uid,f"{'🟢 Автозапуск включён' if val else '🔴 Автозапуск выключен'}")
+            _show_schedule_vk(vk,uid); return
+        if text in ("🟢 Автоостановка","🔴 Автоостановка"):
+            val=_toggle_schedule_vk("auto_stop_enabled")
+            send(vk,uid,f"{'🟢 Автоостановка включена' if val else '🔴 Автоостановка выключена'}")
+            _show_schedule_vk(vk,uid); return
+        if text=="🕐 Время запуска":
+            states[uid]="schedule_start_time"; send(vk,uid,"Введи время автозапуска (ЧЧ:ММ), например: 09:00"); return
+        if text=="🕐 Время остановки":
+            states[uid]="schedule_stop_time"; send(vk,uid,"Введи время остановки (ЧЧ:ММ), например: 23:00"); return
+        _show_schedule_vk(vk,uid); return
+
+    if st=="schedule_start_time":
+        if re.match(r'^\d{1,2}:\d{2}$',text):
+            try:
+                h,m=text.split(":"); assert 0<=int(h)<24 and 0<=int(m)<60
+                _set_schedule_time_vk("start_time",f"{int(h):02d}:{m}")
+                states[uid]="schedule_vk"; send(vk,uid,f"✅ Время запуска: {int(h):02d}:{m}")
+                _show_schedule_vk(vk,uid)
+            except: send(vk,uid,"❌ Неверный формат ЧЧ:ММ")
+        else: send(vk,uid,"❌ Формат ЧЧ:ММ, например: 09:00")
+        return
+
+    if st=="schedule_stop_time":
+        if re.match(r'^\d{1,2}:\d{2}$',text):
+            try:
+                h,m=text.split(":"); assert 0<=int(h)<24 and 0<=int(m)<60
+                _set_schedule_time_vk("stop_time",f"{int(h):02d}:{m}")
+                states[uid]="schedule_vk"; send(vk,uid,f"✅ Время остановки: {int(h):02d}:{m}")
+                _show_schedule_vk(vk,uid)
+            except: send(vk,uid,"❌ Неверный формат ЧЧ:ММ")
+        else: send(vk,uid,"❌ Формат ЧЧ:ММ, например: 23:00")
+        return
+
     if st=="set_retention":
         try:
             d=int(text); assert d>=1
@@ -3244,6 +3686,154 @@ def handle(vk,uid,text):
         return
 
     # ── 💻 Терминал ──────────────────────────────────────────────
+    if st=="tg_bridge":
+        if text=="« Назад":
+            states[uid]="tools"; send(vk,uid,"🔧 Инструменты:",kbd_tools(uid)); return
+        if text=="💬 Чаты":
+            chats=[(r[0],r[1],r[2]) for r in bridge_get_known_chats()]
+            if not chats:
+                send(vk,uid,"📭 Нет известных чатов. Мост должен получить хотя бы одно сообщение.",kbd_tg_bridge()); return
+            states[uid]="tg_bridge_chats"
+            pending[uid]={"chats":chats}
+            _show_bridge_chats(vk,uid,chats)
+        elif text=="✏️ Написать":
+            chats=[(r[0],r[1],r[2]) for r in bridge_get_known_chats() if r[2]]
+            if not chats: send(vk,uid,"❌ Нет активных чатов. Включи в 💬 Чаты.",kbd_tg_bridge()); return
+            lines=["✏️ Выбери чат:\n"]
+            for i,(cid,cname,_) in enumerate(chats,1): lines.append(f"{i}. {cname}")
+            send(vk,uid,"\n".join(lines)+"\n\nВведи номер:")
+            states[uid]="tg_bridge_write_pick"; pending[uid]={"chats":chats}
+        elif text=="↩️ Ответить":
+            send(vk,uid,"↩️ Введи ref (chat_id:msg_id), например: -100123456:789")
+            states[uid]="tg_bridge_reply_ref"
+        elif text=="↪️ Переслать":
+            send(vk,uid,"↪️ Введи ref (chat_id:msg_id) для пересылки:")
+            states[uid]="tg_bridge_fwd_ref"
+        elif text=="📋 История чата":
+            chats=[(r[0],r[1],r[2]) for r in bridge_get_known_chats() if r[2]]
+            if not chats: send(vk,uid,"❌ Нет активных чатов.",kbd_tg_bridge()); return
+            lines=["📋 Выбери чат:\n"]
+            for i,(cid,cname,_) in enumerate(chats,1): lines.append(f"{i}. {cname}")
+            send(vk,uid,"\n".join(lines)+"\n\nВведи номер:")
+            states[uid]="tg_bridge_history_pick"; pending[uid]={"chats":chats}
+        elif "Мост" in text:
+            if "активен" in text:
+                subprocess.run(["sudo","systemctl","stop","vm-bridge-tg"])
+                send(vk,uid,"⏹ Мост остановлен",kbd_tg_bridge())
+            else:
+                subprocess.run(["sudo","systemctl","start","vm-bridge-tg"])
+                send(vk,uid,"▶️ Мост запущен",kbd_tg_bridge())
+        else: send(vk,uid,"❓",kbd_tg_bridge())
+        return
+
+    if st=="tg_bridge_chats":
+        chats=pending.get(uid,{}).get("chats",[])
+        if text in ("✅ Готово","« Назад"):
+            states[uid]="tg_bridge"; pending.pop(uid,None); send(vk,uid,"📱 TG Мост:",kbd_tg_bridge()); return
+        for cid,cname,act in chats:
+            for lbl in (("✅ "+str(cname)[:25]),("⬜ "+str(cname)[:25])):
+                if text==lbl:
+                    bridge_set_active(cid,not act)
+                    upd=[(c,n,(not a) if c==cid else a) for c,n,a in chats]
+                    pending[uid]["chats"]=upd
+                    _show_bridge_chats(vk,uid,upd); return
+        _show_bridge_chats(vk,uid,chats)
+        return
+
+    if st=="tg_bridge_write_pick":
+        if text=="« Назад":
+            states[uid]="tg_bridge"; send(vk,uid,"📱 TG Мост:",kbd_tg_bridge()); return
+        chats=pending.get(uid,{}).get("chats",[])
+        try:
+            n=int(text.strip())-1
+            if not 0<=n<len(chats): send(vk,uid,f"❌ Номер 1-{len(chats)}"); return
+            cid,cname,_=chats[n]
+            pending[uid]["sel"]=(cid,cname)
+            states[uid]="tg_bridge_write_text"
+            send(vk,uid,f"✏️ Пишем в «{cname}»\nВведи текст:")
+        except: send(vk,uid,"❌ Введи число")
+        return
+
+    if st=="tg_bridge_write_text":
+        if text=="« Назад":
+            states[uid]="tg_bridge"; send(vk,uid,"📱 TG Мост:",kbd_tg_bridge()); return
+        sel=pending.pop(uid,{}).get("sel")
+        if not sel: states[uid]="tg_bridge"; send(vk,uid,"❌ Сессия истекла",kbd_tg_bridge()); return
+        cid,cname=sel
+        if bridge_queue_cmd("send_text",chat_id=cid,text=text):
+            send(vk,uid,f"✅ Отправлено в «{cname}»",kbd_tg_bridge())
+        else: send(vk,uid,"❌ Мост недоступен",kbd_tg_bridge())
+        states[uid]="tg_bridge"; return
+
+    if st=="tg_bridge_reply_ref":
+        if text=="« Назад":
+            states[uid]="tg_bridge"; send(vk,uid,"📱 TG Мост:",kbd_tg_bridge()); return
+        msg=bridge_get_msg(text.strip())
+        if not msg: send(vk,uid,"❌ Ref не найден. Формат: chat_id:msg_id"); return
+        pending[uid]={"rep_chat":msg["tg_chat_id"],"rep_msg":msg["tg_msg_id"],"sender":msg["sender"]}
+        states[uid]="tg_bridge_reply_text"
+        send(vk,uid,f"↩️ Ответ {msg['sender']} ({msg['chat_name']})\nВведи текст:")
+        return
+
+    if st=="tg_bridge_reply_text":
+        if text=="« Назад":
+            states[uid]="tg_bridge"; pending.pop(uid,None); send(vk,uid,"📱 TG Мост:",kbd_tg_bridge()); return
+        d=pending.pop(uid,{})
+        if bridge_queue_cmd("send_text",chat_id=d.get("rep_chat"),text=text,reply_to=d.get("rep_msg")):
+            send(vk,uid,"✅ Ответ отправлен",kbd_tg_bridge())
+        else: send(vk,uid,"❌ Мост недоступен",kbd_tg_bridge())
+        states[uid]="tg_bridge"; return
+
+    if st=="tg_bridge_fwd_ref":
+        if text=="« Назад":
+            states[uid]="tg_bridge"; send(vk,uid,"📱 TG Мост:",kbd_tg_bridge()); return
+        msg=bridge_get_msg(text.strip())
+        if not msg: send(vk,uid,"❌ Ref не найден"); return
+        chats=[(r[0],r[1],r[2]) for r in bridge_get_known_chats() if r[2]]
+        if not chats: send(vk,uid,"❌ Нет активных чатов",kbd_tg_bridge()); states[uid]="tg_bridge"; return
+        lines=["↪️ Переслать в:\n"]
+        for i,(cid,cname,_) in enumerate(chats,1): lines.append(f"{i}. {cname}")
+        pending[uid]={"fwd_chat":msg["tg_chat_id"],"fwd_msg":msg["tg_msg_id"],"to_chats":chats}
+        send(vk,uid,"\n".join(lines)+"\n\nВведи номер:")
+        states[uid]="tg_bridge_fwd_pick"; return
+
+    if st=="tg_bridge_fwd_pick":
+        if text=="« Назад":
+            states[uid]="tg_bridge"; pending.pop(uid,None); send(vk,uid,"📱 TG Мост:",kbd_tg_bridge()); return
+        d=pending.pop(uid,{}); chats=d.get("to_chats",[])
+        try:
+            n=int(text.strip())-1
+            if not 0<=n<len(chats): send(vk,uid,f"❌ Номер 1-{len(chats)}"); return
+            if bridge_queue_cmd("forward",chat_id=chats[n][0],fwd_chat=d["fwd_chat"],fwd_msg=d["fwd_msg"]):
+                send(vk,uid,f"✅ Переслано в «{chats[n][1]}»",kbd_tg_bridge())
+            else: send(vk,uid,"❌ Мост недоступен",kbd_tg_bridge())
+        except: send(vk,uid,"❌ Введи число")
+        states[uid]="tg_bridge"; return
+
+    if st=="tg_bridge_history_pick":
+        if text=="« Назад":
+            states[uid]="tg_bridge"; send(vk,uid,"📱 TG Мост:",kbd_tg_bridge()); return
+        chats=pending.pop(uid,{}).get("chats",[])
+        try:
+            n=int(text.strip())-1
+            if not 0<=n<len(chats): send(vk,uid,f"❌ Номер 1-{len(chats)}"); return
+            cid,cname,_=chats[n]
+            rows=bridge_get_history(cid,100)
+            if not rows: send(vk,uid,"📭 История пуста",kbd_tg_bridge()); states[uid]="tg_bridge"; return
+            import tempfile as _tf,os as _os
+            lines_h=[]
+            for r in reversed(list(rows)): lines_h.append(f"[{str(r[3])[:16]}] {r[1]}: ref={r[0]}")
+            body=f"История чата: {cname}\n{"="*40}\n"+"\n".join(lines_h)
+            with _tf.NamedTemporaryFile(delete=False,suffix=".txt",mode="w",encoding="utf-8") as f:
+                f.write(body); fpath=f.name
+            try:
+                att=vk_upload_doc(uid,fpath,f"history_{cname[:15]}.txt",f"История {cname}")
+                send_attach(vk,uid,f"📋 История «{cname}» ({len(rows)} строк)",att,kbd_tg_bridge())
+            except: send(vk,uid,body[:4000],kbd_tg_bridge())
+            _os.unlink(fpath)
+        except Exception as e: send(vk,uid,f"❌ {e}",kbd_tg_bridge())
+        states[uid]="tg_bridge"; return
+
     if st=="console":
         if text=="« Назад":
             states[uid]="main"; send(vk,uid,"Главное меню:",kbd_main()); return
@@ -3416,17 +4006,7 @@ def handle(vk,uid,text):
         elif text=="⏰ Расписание":
             if not user_can(uid,"vm_control"):
                 send(vk,uid,"⛔ Расписание доступно только администратору",kbd_main()); return
-            try:
-                sc=json.load(open(BASE_DIR/"schedule.json")) if (BASE_DIR/"schedule.json").exists() else {}
-            except: sc={}
-            s="🟢" if sc.get("auto_start_enabled") else "🔴"
-            p="🟢" if sc.get("auto_stop_enabled") else "🔴"
-            st_time=sc.get("start_time","09:00"); sp_time=sc.get("stop_time","22:00")
-            send(vk,uid,
-                f"⏰ Расписание ВМ\n\n"
-                f"{s} Автозапуск: {'включён' if sc.get('auto_start_enabled') else 'выключен'} [{st_time}]\n"
-                f"{p} Автоостановка: {'включена' if sc.get('auto_stop_enabled') else 'выключена'} [{sp_time}]\n\n"
-                f"Управление расписанием — в Telegram боте.",kbd_main())
+            states[uid]="schedule_vk"; _show_schedule_vk(vk,uid)
         else: send(vk,uid,"❓ Используйте кнопки.",kbd_main())
 
     elif st=="tools":
@@ -3447,6 +4027,12 @@ def handle(vk,uid,text):
             if not user_can(uid,"xui"):
                 send(vk,uid,"⛔ Ядро доступно только администратору",kbd_tools(uid)); return
             states[uid]="xui"; send(vk,uid,"⚙️ Ядро:",kbd_xui())
+        elif text=="📱 TG Мост":
+            if not is_admin(uid):
+                send(vk,uid,"⛔ TG Мост только для администратора",kbd_tools(uid)); return
+            if not BRIDGE_DB.exists():
+                send(vk,uid,"❌ TG Мост не установлен\nПункт 10 в меню установщика",kbd_tools(uid)); return
+            states[uid]="tg_bridge"; send(vk,uid,"📱 TG Мост:",kbd_tg_bridge())
         elif text=="🎬 YouTube":
             if not user_can(uid,"youtube"):
                 send(vk,uid,"⛔ YouTube-функции вам недоступны",kbd_tools(uid)); return
