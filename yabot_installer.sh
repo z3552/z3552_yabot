@@ -430,7 +430,7 @@ create_shared_config() {
         VK_BLOCK='"vk":null'
     fi
 
-    BRIDGE_BLOCK='"tg_bridge":{"api_id":"'${BRIDGE_API_ID:-}'"","api_hash":"'${BRIDGE_API_HASH:-}'"'}'
+    BRIDGE_BLOCK="\"tg_bridge\":{\"api_id\":\"${BRIDGE_API_ID:-}\",\"api_hash\":\"${BRIDGE_API_HASH:-}\"}"
     printf '{"installed":%s,"vm_id":"%s","folder_id":"%s","admin_pin":"%s",%s,%s,%s}\n' \
         "$INSTALLED_JSON" "$VM_ID" "$FOLDER_ID" "$ADMIN_PIN" "$TG_BLOCK" "$VK_BLOCK" "$BRIDGE_BLOCK" \
         > "$SHARED_CONFIG"
